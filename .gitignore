@@ -216,5 +216,7 @@ models/
 wandb/
 
 # Ignore notebooks
-
 notebooks/
+
+# **** TempCodeRunnerFile.py
+src/graph_ml/tempCodeRunnerFile.py

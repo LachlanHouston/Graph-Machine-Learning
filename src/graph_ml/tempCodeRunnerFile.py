@@ -1,1 +1,0 @@
-criterion(train_logits, train_targets)
