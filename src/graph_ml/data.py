@@ -1,27 +1,11 @@
-import json, os
-import math, copy, time
-import numpy as np
 from collections import defaultdict
-import pandas as pd
-import torch
 from .utils import *
-
-import math
-from tqdm import tqdm
-
-import seaborn as sb
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-
-import dill
-from functools import partial
-import multiprocessing as mp
 
 class Graph():
     def __init__(self):
         super(Graph, self).__init__()
         '''
-            node_forward and bacward are only used when building the data. 
+            node_forward and backward are only used when building the data. 
             Afterwards will be transformed into node_feature by DataFrame
             
             node_forward: name -> node_id
@@ -29,7 +13,7 @@ class Graph():
             node_feature: a DataFrame containing all features
         '''
         self.node_forward = defaultdict(lambda: {})
-        self.node_bacward = defaultdict(lambda: [])
+        self.node_backward = defaultdict(lambda: [])
         self.node_feature = defaultdict(lambda: [])
 
         '''
@@ -47,11 +31,12 @@ class Graph():
     def add_node(self, node):
         nfl = self.node_forward[node['type']]
         if node['id'] not in nfl:
-            self.node_bacward[node['type']] += [node]
+            self.node_backward[node['type']] += [node]
             ser = len(nfl)
             nfl[node['id']] = ser
             return ser
         return nfl[node['id']]
+    
     def add_edge(self, source_node, target_node, time = None, relation_type = None, directed = True):
         edge = [self.add_node(source_node), self.add_node(target_node)]
         '''
@@ -65,7 +50,7 @@ class Graph():
         self.times[time] = True
         
     def update_node(self, node):
-        nbl = self.node_bacward[node['type']]
+        nbl = self.node_backward[node['type']]
         ser = self.add_node(node)
         for k in node:
             if k not in nbl[ser]:

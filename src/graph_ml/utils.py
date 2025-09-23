@@ -107,7 +107,10 @@ def feature_MAG(layer_data, graph):
         
     return feature, times, indxs, texts
 
-def sample_subgraph(graph, sampled_depth = 2, sampled_number = 8, inp = None, feature_extractor = feature_OAG):
+def sample_subgraph(graph, sampled_depth=2, sampled_number=8, inp=None,
+                    feature_extractor=feature_OAG, enforce_causality=True,
+                    relation_blocklist={'has_category', 'rev_has_category'}):
+    relation_blocklist = set(relation_blocklist or [])
     '''
         Sample Sub-Graph based on the connection of other nodes with currently sampled nodes
         We maintain budgets for each node type, indexed by <node_id, time>.
@@ -136,6 +139,9 @@ def sample_subgraph(graph, sampled_depth = 2, sampled_number = 8, inp = None, fe
         for source_type in te:
             tes = te[source_type]
             for relation_type in tes:
+                # skip blocked relations
+                if relation_type in relation_blocklist:
+                    continue
                 if relation_type == 'self' or target_id not in tes[relation_type]:
                     continue
                 adl = tes[relation_type][target_id]
@@ -144,15 +150,13 @@ def sample_subgraph(graph, sampled_depth = 2, sampled_number = 8, inp = None, fe
                 else:
                     sampled_ids = np.random.choice(list(adl.keys()), sampled_number, replace = False)
                 for source_id in sampled_ids:
-                    source_time = adl[source_id]
-                    if source_time == None:
-                        source_time = target_time
+                    e = adl[source_id]
+                    source_time = target_time if (e is None) else e
                     if source_id in layer_data[source_type]:
                         continue
                     budget[source_type][source_id][0] += 1. / len(sampled_ids)
                     budget[source_type][source_id][1] = source_time
 
- 
 
     '''
         First adding the sampled nodes then updating budget.
@@ -200,98 +204,136 @@ def sample_subgraph(graph, sampled_depth = 2, sampled_number = 8, inp = None, fe
     '''
     feature, times, indxs, texts = feature_extractor(layer_data, graph)
             
-    edge_list = defaultdict( #target_type
-                        lambda: defaultdict(  #source_type
-                            lambda: defaultdict(  #relation_type
-                                lambda: [] # [target_id, source_id] 
-                                    )))
+    edge_list = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    edge_time_list = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+    # self loops unchanged
     for _type in layer_data:
         for _key in layer_data[_type]:
             _ser = layer_data[_type][_key][0]
-            edge_list[_type][_type]['self'] += [[_ser, _ser]]
-    '''
-        Reconstruct sampled adjacancy matrix by checking whether each
-        link exist in the original graph
-    '''
+            edge_list[_type][_type]['self'].append([_ser, _ser])
+            edge_time_list[_type][_type]['self'].append(0)  # or a neutral bucket
+
+    # rebuild edges from original graph
     for target_type in graph.edge_list:
+        tld = layer_data.get(target_type, {})
+        if not tld: 
+            continue
         te = graph.edge_list[target_type]
-        tld = layer_data[target_type]
         for source_type in te:
+            sld = layer_data.get(source_type, {})
+            if not sld:
+                continue
             tes = te[source_type]
-            sld  = layer_data[source_type]
-            for relation_type in tes:
-                tesr = tes[relation_type]
-                for target_key in tld:
+            for relation_type, tesr in tes.items():
+                if relation_type in relation_blocklist:
+                    continue
+                for target_key, src_dict in tld.items():
                     if target_key not in tesr:
                         continue
-                    target_ser = tld[target_key][0]
-                    for source_key in tesr[target_key]:
-                        '''
-                            Check whether each link (target_id, source_id) exist in original adjacancy matrix
-                        '''
-                        if source_key in sld:
-                            source_ser = sld[source_key][0]
-                            edge_list[target_type][source_type][relation_type] += [[target_ser, source_ser]]
-    return feature, times, edge_list, indxs, texts
+                    target_ser = src_dict[0]
+                    t_target = src_dict[1]  # target node time
+                    for source_key, e_time in tesr[target_key].items():
+                        if source_key not in sld:
+                            continue
+                        if e_time is None:
+                            e_time = layer_data[source_type][source_key][1]
+                        if enforce_causality and (e_time is not None) and (e_time > t_target):
+                            continue
+                        source_ser = layer_data[source_type][source_key][0]
+                        edge_list[target_type][source_type][relation_type].append([target_ser, source_ser])
+                        edge_time_list[target_type][source_type][relation_type].append(e_time if e_time is not None else t_target)
+    return feature, times, edge_list, edge_time_list, indxs, texts
 
-def to_torch(feature, time, edge_list, graph, device):
-    '''
-        Transform a sampled sub-graph into pytorch Tensor
-        node_dict: {node_type: <node_number, node_type_ID>} node_number is used to trace back the nodes in original graph.
-        edge_dict: {edge_type: edge_type_ID}
-    '''
+def to_torch(feature, time, edge_list, edge_time_list, graph, device,
+             relation_blocklist={'has_category','rev_has_category'},
+             type_blocklist=None,
+             bucket_days=30,
+             max_span_days=365*5):
+    relation_blocklist = set(relation_blocklist or [])
+    type_blocklist = set(type_blocklist or [])
+
     node_dict = {}
-    node_feature = []
-    node_type    = []
-    node_time    = []
-    edge_index   = []
-    edge_type    = []
-    edge_time    = []
-    
-    node_num = 0
-    types = graph.get_types()
-    for t in types:
-        node_dict[t] = [node_num, len(node_dict)]
-        node_num     += len(feature[t])
+    node_feature, node_type, node_time = [], [], []
 
-    for t in types:
+    # Build node_dict from sampled types present in 'feature'
+    present_types = [t for t in feature.keys() if t not in type_blocklist]
+    offset = 0
+    for t in present_types:
+        node_dict[t] = [offset, len(node_dict)]
+        offset += len(feature[t])
+
+    for t in present_types:
         node_feature += list(feature[t])
+        node_type    += [node_dict[t][1]] * len(feature[t])
         node_time    += list(time[t])
-        node_type    += [node_dict[t][1] for _ in range(len(feature[t]))]
-        
+
+    # Might want to bucketize in future
+    def bucketize(dt_days):
+        # clip to window and shift to non-negative
+        span = max_span_days
+        dt = int(np.clip(dt_days, -span, span))
+        half = span // bucket_days
+        return (dt // bucket_days) + half  # integer index in [0, 2*half]
+
+    edge_index, edge_type, edge_time = [], [], []
+
+    edge_dict = {}
     edge_dict = {e[2]: i for i, e in enumerate(graph.get_meta_graph())}
     edge_dict['self'] = len(edge_dict)
 
-    for target_type in edge_list:
-        for source_type in edge_list[target_type]:
-            for relation_type in edge_list[target_type][source_type]:
-                for ii, (ti, si) in enumerate(edge_list[target_type][source_type][relation_type]):
-                    tid, sid = ti + node_dict[target_type][0], si + node_dict[source_type][0]
-                    edge_index += [[sid, tid]]
-                    edge_type  += [edge_dict[relation_type]]   
-                    '''
-                        Our time ranges from 1900 - 2020, largest span is 120.
-                    '''
-                    edge_time  += [node_time[tid] - node_time[sid] + 120]
-    node_feature = torch.FloatTensor(node_feature).to(device)
-    node_type    = torch.LongTensor(node_type).to(device)
-    edge_time    = torch.LongTensor(edge_time).to(device)
-    edge_index   = torch.LongTensor(edge_index).t().to(device)
-    edge_type    = torch.LongTensor(edge_type).to(device)
+    # iterate edges
+    for tt in edge_list:
+        if tt not in node_dict: continue
+        t_off = node_dict[tt][0]
+        for st in edge_list[tt]:
+            if st not in node_dict: continue
+            s_off = node_dict[st][0]
+            for rel, pairs in edge_list[tt][st].items():
+                if rel in relation_blocklist: 
+                    continue
+                if rel not in edge_dict:
+                    continue
+                times_for_rel = edge_time_list[tt][st][rel]
+                for (ti, si), e_time_abs in zip(pairs, times_for_rel):
+                    tid = ti + t_off
+                    sid = si + s_off
+
+                    t_abs = node_time[tid]
+                    dt = t_abs - e_time_abs
+                    edge_index.append([sid, tid])
+                    edge_type.append(edge_dict[rel])
+                    edge_time.append(dt)
+
+    # Tensorize
+    device = torch.device(device)
+    node_feature = torch.tensor(node_feature, dtype=torch.float32, device=device)
+    node_type    = torch.tensor(node_type,    dtype=torch.long,   device=device)
+    if len(edge_index) == 0:
+        edge_index = torch.empty((2,0), dtype=torch.long, device=device)
+        edge_type  = torch.empty((0,),  dtype=torch.long, device=device)
+        edge_time  = torch.empty((0,),  dtype=torch.long, device=device)
+    else:
+        edge_index = torch.tensor(edge_index, dtype=torch.long, device=device).t().contiguous()
+        edge_type  = torch.tensor(edge_type,  dtype=torch.long, device=device)
+        edge_time  = torch.tensor(edge_time,  dtype=torch.long, device=device)
+
     return node_feature, node_type, edge_time, edge_index, edge_type, node_dict, edge_dict
 
 def graph_sample(graph, target, args, seed, samp_nodes, device='cpu'):
     np.random.seed(seed)
-    ylabel = torch.LongTensor(graph.y[samp_nodes])
-    feature, times, edge_list, indxs, _ = sample_subgraph(
+    feature, times, edge_list, edge_time_list, indxs, _ = sample_subgraph(
         graph,
-        inp={target: np.concatenate([samp_nodes, graph.years[samp_nodes]]).reshape(2, -1).T},
+        inp={target: np.stack([samp_nodes, graph.years[samp_nodes]], axis=1)},
         sampled_depth=args.sample_depth,
         sampled_number=args.sample_width,
-        feature_extractor=feature_MAG
+        feature_extractor=feature_MAG,
+        relation_blocklist={'has_category','rev_has_category'},
+        enforce_causality=False,
     )
+
     node_feature, node_type, edge_time, edge_index, edge_type, *_ = \
-        to_torch(feature, times, edge_list, graph, device)
+        to_torch(feature, times, edge_list, edge_time_list, graph, device)
 
     train_mask = graph.train_mask[indxs[target]]
     valid_mask = graph.valid_mask[indxs[target]]
@@ -299,16 +341,16 @@ def graph_sample(graph, target, args, seed, samp_nodes, device='cpu'):
     ylabel     = graph.y[indxs[target]]
     return node_feature, node_type, edge_time, edge_index, edge_type, (train_mask, valid_mask, test_mask), ylabel
 
-def prepare_data(pool, graph, target, target_nodes, args, task_type='train', s_idx=0, n_batch=None, batch_size=None, device='cpu'):
+def prepare_data(pool, graph, target, target_nodes, args, task_type='train', target_type='business', s_idx=0, n_batch=None, batch_size=None, device='cpu'):
     n_batch = n_batch if n_batch is not None else args.n_batch
     batch_size = batch_size if batch_size is not None else args.batch_size
 
     jobs = []
     if task_type == 'train':
         for _ in range(n_batch):
-            target = np.random.choice(target_nodes, batch_size, replace=False)
+            samp_nodes = np.random.choice(target_nodes, batch_size, replace=False)
             jobs.append(pool.apply_async(
-                graph_sample, args=(graph, target, args, random.randint(0, 2**31 - 1), target, device)
+                graph_sample, args=(graph, target_type, args, random.randint(0, 2**31-1), samp_nodes, device)
             ))
     elif task_type == 'sequential':
         for i in range(n_batch):

@@ -1,4 +1,5 @@
 import sys
+import os
 import platform
 import multiprocessing as mp
 from contextlib import nullcontext
@@ -52,12 +53,12 @@ def main():
     parser.add_argument('--n_heads', type=int, default=8, help='Attention heads')
     parser.add_argument('--n_layers', type=int, default=4, help='GNN layers')
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout ratio')
-    parser.add_argument('--sample_depth', type=int, default=6, help='Sampling depth (hops)')
-    parser.add_argument('--sample_width', type=int, default=520, help='Neighbors per hop per type')
-    parser.add_argument('--n_epoch', type=int, default=100, help='Epochs')
+    parser.add_argument('--sample_depth', type=int, default=3, help='Sampling depth (hops)')
+    parser.add_argument('--sample_width', type=int, default=200, help='Neighbors per hop per type')
+    parser.add_argument('--n_epoch', type=int, default=5, help='Epochs')
     parser.add_argument('--n_pool', type=int, default=0, help='Processes for sampling (set 0 to disable)')
     parser.add_argument('--n_batch', type=int, default=32, help='Batches (sampled graphs) per epoch')
-    parser.add_argument('--batch_size', type=int, default=128, help='Output papers per batch')
+    parser.add_argument('--batch_size', type=int, default=64, help='Output papers per batch')
     parser.add_argument('--clip', type=float, default=1.0, help='Gradient norm clipping')
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='Graph Machine Learning', help='wandb project name')
@@ -139,14 +140,14 @@ def main():
                 config=vars(args),
             )
             wandb.log({
-                "dataset/business_count": int(len(graph.node_feature['business'])),
+                "dataset/business_count": int(len(graph.node_feature[target_feature])),
             })
 
     if args.n_pool > 0:
         # Linux only; fork avoids pickling overhead
         ctx = mp.get_context("fork")
         pool = ctx.Pool(args.n_pool)
-        jobs = prepare_data(pool, graph, target_feature, target_nodes, args, task_type="train")
+        jobs = prepare_data(pool, graph, target_feature, target_nodes, args, task_type="train", target_type=target_feature)
     else:
         pool, jobs = None, None
 
@@ -201,7 +202,6 @@ def main():
         batch_iter = tqdm(datas, desc=f"Epoch {epoch}", leave=False)
         for (node_feature, node_type, edge_time, edge_index, edge_type,
          (train_mask, valid_mask, test_mask), ylabel) in batch_iter:
-
             # targets for the output nodes (B, C)
             ylabel = torch.as_tensor(ylabel, dtype=torch.float32, device=device)
 
@@ -214,6 +214,7 @@ def main():
             train_targets = ylabel[train_mask]               # [B_train, C]
 
             loss = criterion(train_logits, train_targets)
+
             # backward
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
