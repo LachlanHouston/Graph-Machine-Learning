@@ -1,165 +1,100 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
-from torch_geometric.nn import GCNConv, GATConv
-from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.nn.inits import glorot, uniform
-from torch_geometric.utils import softmax as pyg_softmax
-import math
+from torch import Tensor
+from torch_geometric.nn import HGTConv
+from torch_geometric.data import HeteroData
+from typing import Tuple
 
-def softmax_mps_safe(src, index, ptr=None, num_nodes=None):
-    if src.device.type != "mps":
-        return pyg_softmax(src, index, num_nodes=num_nodes)
-    
-    # MPS path: do it on CPU to avoid scatter_reduce
-    out_cpu = pyg_softmax(src.float().cpu(), index.cpu(), num_nodes=num_nodes)
-    return out_cpu.to(device=src.device, dtype=src.dtype)
+class EdgeHGT(nn.Module):
+    def __init__(self, metadata, hidden_dim=128, num_layers=2, heads=2, dropout=0.1,
+                 use_pair_interactions: bool = True, edge_feat_dim: int = 1):
+        super().__init__()
+        node_types, edge_types = metadata
+        self.node_types = node_types
+        self.edge_types = edge_types
+        self.hidden_dim = hidden_dim
+        self.use_pair_interactions = use_pair_interactions
+        self.edge_feat_dim = edge_feat_dim  # e.g., 1 for year
 
-class HGTConv(MessagePassing):
-    def __init__(self, in_dim, out_dim, num_types, num_relations, n_heads, dropout = 0.2, use_norm = True, use_RTE = True, **kwargs):
-        super(HGTConv, self).__init__(node_dim=0, aggr='add', **kwargs)
+        # Featureless nodes → id embeddings
+        self.embeds = nn.ModuleDict()
+        self.norms  = nn.ModuleDict()
+        self.dropout = nn.Dropout(dropout)
+        for ntype in node_types:
+            self.embeds[ntype] = None
+            self.norms[ntype]  = nn.LayerNorm(hidden_dim)
 
-        self.in_dim        = in_dim
-        self.out_dim       = out_dim
-        self.num_types     = num_types
-        self.num_relations = num_relations
-        self.total_rel     = num_types * num_relations * num_types
-        self.n_heads       = n_heads
-        self.d_k           = out_dim // n_heads
-        self.sqrt_dk       = math.sqrt(self.d_k)
-        self.use_norm      = use_norm
-        self.use_RTE       = use_RTE
-        self.att           = None
+        self.hgt = nn.ModuleList([
+            HGTConv(
+                in_channels=hidden_dim,
+                out_channels=hidden_dim,
+                metadata=metadata,
+                heads=heads,
+            ) for _ in range(num_layers)
+        ])
 
-        # Attention mechanism layers
-        self.k_linears = nn.ModuleList()
-        self.q_linears = nn.ModuleList()
-        self.v_linears = nn.ModuleList()
+        # Project edge features to hidden, so scales match
+        self.edge_proj = nn.Linear(edge_feat_dim, hidden_dim)
 
-        # Target-Specific Learnable Layer
-        self.a_linears = nn.ModuleList()
+        self._global_num_nodes = {}
 
-        # Norms
-        self.norms = nn.ModuleList()
+    def set_num_nodes(self, num_nodes_by_type: dict):
+        for ntype, N in num_nodes_by_type.items():
+            if self.embeds[ntype] is None:
+                self.embeds[ntype] = nn.Embedding(N, self.hidden_dim)
+                nn.init.normal_(self.embeds[ntype].weight, std=0.02)
+        self._global_num_nodes = num_nodes_by_type
 
-        for t in range(num_types): # num_types is number of node types
-            self.k_linears.append(nn.Linear(in_dim,   out_dim))
-            self.q_linears.append(nn.Linear(in_dim,   out_dim))
-            self.v_linears.append(nn.Linear(in_dim,   out_dim))
-            self.a_linears.append(nn.Linear(out_dim,  out_dim))
-
-            if use_norm:
-                self.norms.append(nn.LayerNorm(out_dim))
-        
-        self.relation_prior = nn.Parameter(torch.ones(num_relations, self.n_heads)) # Mu prior for edge scaled Softmax
-        self.relation_attention = nn.Parameter(torch.Tensor(num_relations, n_heads, self.d_k, self.d_k)) # Learnable prior for Q and K keys
-        self.relation_message = nn.Parameter(torch.Tensor(num_relations, n_heads, self.d_k, self.d_k)) # Learnable prior for V keys
-
-        self.skip = nn.Parameter(torch.ones(num_types)) # Learnable skip connection
-        self.drop = nn.Dropout(dropout)
-
-    def message(self, edge_index_i, node_inp_i, node_inp_j, node_type_i, node_type_j, edge_type, edge_time):
+    def forward(self, batch: HeteroData,
+                rel: Tuple[str,str,str] = ("user","reviews","business")) -> torch.Tensor:
         """
-        Index j is the source node, i is the target node. Performs the Mutual Attention and Message Passing of the model.
-        
+        Returns an edge representation per labeled edge: [E_b, D_edge].
+        If edge_feat is provided, shape should be [E_b, edge_feat_dim].
         """
-        data_size = edge_index_i.size(0)
-        att_tensor = torch.zeros(data_size, self.n_heads).to(node_inp_i.device)
-        msg_tensor = torch.zeros(data_size, self.n_heads, self.d_k).to(node_inp_i.device)
-        
-        for source_type in range(self.num_types):
-            sb = (node_type_j == int(source_type)) # might be sb = source_batch
-            k_linear = self.k_linears[source_type]
-            v_linear = self.v_linears[source_type]
+        x_dict = {}
+        for ntype in batch.node_types:
+            n_id: torch.Tensor = batch[ntype].n_id
+            x = self.embeds[ntype](n_id)
+            x = self.norms[ntype](F.gelu(x))
+            x = self.dropout(x)
+            x_dict[ntype] = x
 
-            for target_type in range(self.num_types):
-                tb = (node_type_i == int(target_type)) & sb
-                q_linear = self.q_linears[target_type]
+        edge_index_dict = {etype: batch[etype].edge_index for etype in batch.edge_types}
 
-                for rel_type in range(self.num_relations):
-                    idx = (edge_type == int(rel_type)) & tb
+        for conv in self.hgt:
+            x_dict = conv(x_dict, edge_index_dict)
+            for ntype in x_dict:
+                x_dict[ntype] = self.dropout(self.norms[ntype](x_dict[ntype]))
 
-                    if idx.sum() == 0:
-                        continue
+        # Pair endpoints for labeled edges
+        eidx: torch.Tensor = batch[rel].edge_label_index
+        u_loc, v_loc = eidx[0], eidx[1]
+        hu = x_dict[rel[0]][u_loc]  # user emb
+        hv = x_dict[rel[2]][v_loc]  # business emb
 
-                    target_node_vec = node_inp_i[idx]
-                    source_node_vec = node_inp_j[idx]
+        # Core pair representation
+        parts = [hu, hv]
 
-                    q_mat = q_linear(target_node_vec).view(-1, self.n_heads, self.d_k)
-                    k_mat = k_linear(source_node_vec).view(-1, self.n_heads, self.d_k)
-                    k_mat = torch.bmm(k_mat.transpose(1, 0), self.relation_attention[rel_type]).transpose(1, 0)
-                    att_tensor[idx] = (q_mat * k_mat).sum(dim=-1) * self.relation_prior[rel_type] / self.sqrt_dk
+        if self.use_pair_interactions:
+            parts += [torch.abs(hu - hv), hu * hv]
 
-                    v_mat = v_linear(source_node_vec).view(-1, self.n_heads, self.d_k)
-                    msg_tensor[idx] = torch.bmm(v_mat.transpose(1, 0), self.relation_message[rel_type]).transpose(1, 0)
+        year_feat = batch[rel].edge_label[:, 1:2].to(hu.dtype)
+        year_emb = self.edge_proj(year_feat)
+        parts.append(year_emb)
 
-        self.att = softmax_mps_safe(att_tensor, edge_index_i)
-        out = msg_tensor * self.att.view(-1, self.n_heads, 1)    
-        return out.view(-1, self.out_dim)
+        return torch.cat(parts, dim=-1)
     
-    def update(self, aggr_out, node_inp, node_type):
-        """
-        Performs the Target-Specific Aggregation step.
-        
-        """
+class EdgeClassifier(nn.Module):
+    def __init__(self, hidden_dim=128, num_classes=5):
+        super().__init__()
+        in_dim = 5*hidden_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, num_classes)
+        )
 
-        aggr_out = F.gelu(aggr_out)
-        out = torch.zeros(aggr_out.size(0), self.out_dim).to(node_inp.device)
-
-        for target_type in range(self.num_types):
-            idx = (node_type == int(target_type))
-            if idx.sum() == 0:
-                continue
-
-            trans_out = self.drop(self.a_linears[target_type](aggr_out[idx]))
-            alpha = torch.sigmoid(self.skip[target_type])
-
-            if self.use_norm:
-                out[idx] = self.norms[target_type](trans_out * alpha + node_inp[idx] * (1 - alpha))
-            else:
-                out[idx] = trans_out * alpha + node_inp[idx] * (1 - alpha) 
-        return out
-    
-    def forward(self, node_inp, node_type, edge_index, edge_type, edge_time):
-        return self.propagate(edge_index, node_inp=node_inp, node_type=node_type, \
-                              edge_type=edge_type, edge_time = edge_time)
-    
-class GNN(nn.Module):
-    def __init__(self, in_dim, n_hid, num_types, num_relations, n_heads, n_layers, dropout = 0.2, conv_name = 'hgt', prev_norm = False, last_norm = False, use_RTE = True):
-        super(GNN, self).__init__()
-        self.gcs = nn.ModuleList()
-        self.num_types = num_types
-        self.in_dim    = in_dim
-        self.n_hid     = n_hid
-        self.adapt_ws  = nn.ModuleList()
-        self.drop      = nn.Dropout(dropout)
-        for t in range(num_types):
-            self.adapt_ws.append(nn.Linear(in_dim, n_hid))
-        for l in range(n_layers - 1):
-            self.gcs.append(HGTConv(n_hid, n_hid, num_types, num_relations, n_heads, dropout, use_norm = prev_norm, use_RTE = use_RTE))
-        self.gcs.append(HGTConv(n_hid, n_hid, num_types, num_relations, n_heads, dropout, use_norm = last_norm, use_RTE = use_RTE))
-
-    def forward(self, node_feature, node_type, edge_time, edge_index, edge_type):
-        dtype = node_feature.dtype
-        res = torch.zeros(node_feature.size(0), self.n_hid, device=node_feature.device, dtype=dtype)
-        #res = torch.zeros(node_feature.size(0), self.n_hid).to(node_feature.device)
-        for t_id in range(self.num_types):
-            idx = (node_type == int(t_id))
-            if idx.sum() == 0:
-                continue
-            res[idx] = torch.tanh(self.adapt_ws[t_id](node_feature[idx]))
-        meta_xs = self.drop(res)
-        for gc in self.gcs:
-            meta_xs = gc(meta_xs, node_type, edge_index, edge_type, edge_time)
-        return meta_xs  
-    
-class Classifier(nn.Module):
-    def __init__(self, n_hid, n_out):
-        super(Classifier, self).__init__()
-        self.n_hid    = n_hid
-        self.n_out    = n_out
-        self.linear   = nn.Linear(n_hid,  n_out)
-    def forward(self, x):
-        x = self.linear(x)
-        return x
+    def forward(self, edge_repr: Tensor) -> Tensor:
+        return self.mlp(edge_repr).squeeze(-1)
