@@ -1,9 +1,4 @@
-import sys
 import os
-import platform
-import multiprocessing as mp
-from contextlib import nullcontext
-
 import argparse
 import time
 
@@ -109,7 +104,7 @@ def main():
     )
 
     stars = data[rel].edge_label           # [E]
-    yearx = data[rel].edge_attr.squeeze(1) # [E] normalized year float32
+    yearx = data[rel].edge_attr.squeeze(1) # [E] years are normalized
 
     train_label = torch.stack([stars[train_idx], yearx[train_idx]], dim=1)  # [Ntr, 2]
     val_label   = torch.stack([stars[val_idx],   yearx[val_idx]],   dim=1)
@@ -183,7 +178,6 @@ def main():
 
     # Training loop
     st = time.time()
-    # Training loop
     epoch_bar = tqdm(range(1, args.n_epoch + 1), desc="Epochs", leave=True)
     for epoch in epoch_bar:
         model.train()
@@ -194,7 +188,6 @@ def main():
         for steps, batch in zip(range(args.n_batch), train_loader):
             batch = batch.to(device)
             y = batch[rel].edge_label[:, 0].float()     # target stars
-            year_feat = batch[rel].edge_label[:, 1:2]   # [B, 1] normalized year
 
             optimizer.zero_grad()
 
@@ -220,7 +213,6 @@ def main():
 
         batch_bar.close()
         avg_loss = total_loss / max(1, steps + 1)
-
 
         # Validation
         model.eval()

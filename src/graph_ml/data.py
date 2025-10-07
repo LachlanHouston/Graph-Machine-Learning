@@ -13,32 +13,6 @@ def _file_fingerprint(p: Path) -> str:
     st = p.stat()
     return f"{st.st_size}-{st.st_mtime_ns}"
 
-def _cache_key(
-    data_dir: Path,
-    max_reviews: Optional[int],
-    min_review_len: int,
-    seed: int,
-    include_user_friends: bool,
-    max_friends_per_user: Optional[int],
-) -> str:
-    fp_rev = data_dir / "yelp_academic_dataset_review.json"
-    fp_user = data_dir / "yelp_academic_dataset_user.json"
-    fp_biz = data_dir / "yelp_academic_dataset_business.json"
-
-    parts = {
-        "max_reviews": max_reviews,
-        "min_review_len": min_review_len,
-        "seed": seed,
-        "rev_fp": _file_fingerprint(fp_rev),
-        "user_fp": _file_fingerprint(fp_user),
-        "biz_fp": _file_fingerprint(fp_biz),
-        "include_user_friends": include_user_friends,
-        "max_friends_per_user": max_friends_per_user,
-        "schema": "user-reviews-business+friends@v2",  # bump if layout changes
-    }
-    s = json.dumps(parts, sort_keys=True).encode("utf-8")
-    return hashlib.sha1(s).hexdigest()[:16]
-
 def _parse_friends_field(s: Optional[str]) -> List[str]:
     """Yelp 'friends' is a comma-separated string or 'None'."""
     if not s or s == "None":
@@ -69,25 +43,24 @@ def load_yelp_as_hetero(
     Only users that appear in the review subgraph are kept for friendships.
     """
     data_dir = Path(data_dir)
+
+    # ----- try cache -----
+    if cache:
+        cache_dir = data_dir / cache_subdir
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"yelp_hetero.pt"
+        if cache_path.exists():
+            obj = torch.load(cache_path, map_location="cpu", weights_only=False)
+            data = obj["data"] if isinstance(obj, dict) and "data" in obj else obj
+            print(f"[cache] Loaded preprocessed graph: {cache_path}")
+            return data
+    
     fp_rev = data_dir / "yelp_academic_dataset_review.json"
     fp_user = data_dir / "yelp_academic_dataset_user.json"
     fp_biz = data_dir / "yelp_academic_dataset_business.json"
     for f in [fp_rev, fp_user, fp_biz]:
         if not f.exists():
             raise FileNotFoundError(f"Missing file: {f}")
-
-    # ----- try cache -----
-    if cache:
-        key = _cache_key(data_dir, max_reviews, min_review_len, seed,
-                         include_user_friends, max_friends_per_user)
-        cache_dir = data_dir / cache_subdir
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"yelp_hetero_{key}.pt"
-        if cache_path.exists():
-            obj = torch.load(cache_path, map_location="cpu")
-            data = obj["data"] if isinstance(obj, dict) and "data" in obj else obj
-            print(f"[cache] Loaded preprocessed graph: {cache_path}")
-            return data
 
     # ----- build fresh -----
     set_seed(seed)
@@ -215,13 +188,10 @@ def load_yelp_as_hetero(
               f"({len(friend_pairs)} undirected pairs). Dropped self-links: {dropped_self}")
 
     if cache:
-        key = _cache_key(data_dir, max_reviews, min_review_len, seed,
-                         include_user_friends, max_friends_per_user)
         cache_dir = data_dir / cache_subdir
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"yelp_hetero_{key}.pt"
+        cache_path = cache_dir / f"yelp_hetero.pt"
         meta = {
-            "key": key,
             "max_reviews": max_reviews,
             "min_review_len": min_review_len,
             "seed": seed,
