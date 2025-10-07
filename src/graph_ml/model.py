@@ -96,5 +96,7 @@ class EdgeClassifier(nn.Module):
             nn.Linear(hidden_dim, num_classes)
         )
 
+        self.sigmoid = nn.Sigmoid()
+
     def forward(self, edge_repr: Tensor) -> Tensor:
         return self.mlp(edge_repr).squeeze(-1)
