@@ -4,7 +4,7 @@ from invoke import Context, task
 
 WINDOWS = os.name == "nt"
 PROJECT_NAME = "graph_ml"
-PYTHON_VERSION = "3.11.5"
+PYTHON_VERSION = "3.9.5"
 
 # Setup commands
 @task

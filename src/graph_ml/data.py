@@ -138,11 +138,11 @@ def load_yelp_as_hetero(
     rel_reviews = ("user", "reviews", "business")
     edge_index_reviews = torch.tensor(np.vstack([u_idx, b_idx]), dtype=torch.long)
     data[rel_reviews].edge_index = edge_index_reviews
-    data[rel_reviews].edge_label = torch.tensor(stars, dtype=torch.float32)
-    data[rel_reviews].edge_attr = torch.tensor(years_norm[:, None], dtype=torch.float32)
+    data[rel_reviews].edge_label = torch.tensor(stars, dtype=torch.long)
+    data[rel_reviews].time = torch.tensor(years[:, None], dtype=torch.long)
 
     data[("business", "rev_reviews", "user")].edge_index = edge_index_reviews.flip(0)
-    data[("business", "rev_reviews", "user")].edge_attr = data[rel_reviews].edge_attr
+    data[("business", "rev_reviews", "user")].time = data[rel_reviews].time
 
     if include_user_friends:
         # Collect friendships only among users that appear in the review subgraph
@@ -153,13 +153,11 @@ def load_yelp_as_hetero(
                 j = json.loads(line)
                 uid = j.get("user_id")
                 if uid not in u2i:
-                    continue  # only keep edges among 'active' users
+                    continue 
                 u_idx_global = u2i[uid]
                 friends_list = _parse_friends_field(j.get("friends", "None"))
 
-                # Optionally cap degree to avoid huge graphs
                 if max_friends_per_user is not None and len(friends_list) > max_friends_per_user:
-                    # You could do deterministic or random; deterministic slice is fine
                     friends_list = friends_list[:max_friends_per_user]
 
                 for fid in friends_list:
@@ -186,6 +184,18 @@ def load_yelp_as_hetero(
         data[("user", "friends", "user")].edge_index = uu_edge_index
         print(f"Friend graph: {uu_edge_index.size(1)} directed edges "
               f"({len(friend_pairs)} undirected pairs). Dropped self-links: {dropped_self}")
+        
+        # Add time dummy feature for friends edges
+        E_f = data[("user","friends","user")].edge_index.size(1)
+        data[("user", "friends", "user")].time = torch.full(
+            (E_f,), float(y_min) - 1.0, dtype=torch.long
+        )
+
+        # Ensure that time is a 1D vector
+        for et in [("user","reviews","business"), ("business","rev_reviews","user")]:
+            if "time" in data[et]:
+                t = data[et].time
+                data[et].time = t.view(-1)
 
     if cache:
         cache_dir = data_dir / cache_subdir
@@ -229,3 +239,48 @@ def split_edge_indices(
     val_idx  = torch.as_tensor(idx[n_test:n_test+n_val], dtype=torch.long)
     train_idx= torch.as_tensor(idx[n_test+n_val:], dtype=torch.long)
     return train_idx, val_idx, test_idx
+
+def split_edge_indices_by_year(
+    data,
+    rel: Tuple[str, str, str] = ("user","reviews","business"),
+    boundary_year: int = 2021,
+    include_boundary_in_train: bool = True,
+    shuffle_within_splits: bool = False,
+    seed: int = 42,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Split edges temporally using the year stored in `data[rel].time`:
+      - Train: years <= boundary_year   (if include_boundary_in_train=True)
+               or years <  boundary_year (if False)
+      - Val:   the complement (strictly after the boundary)
+
+    Returns:
+        train_idx, val_idx  (both 1-D Long tensors)
+    """
+    years = data[rel].time.view(-1)  # ensure 1-D
+    if include_boundary_in_train:
+        train_mask = years <= boundary_year
+        val_mask   = years >  boundary_year
+    else:
+        train_mask = years <  boundary_year
+        val_mask   = years >= boundary_year
+
+    train_idx = train_mask.nonzero(as_tuple=False).view(-1).to(torch.long)
+    val_idx   = val_mask.nonzero(as_tuple=False).view(-1).to(torch.long)
+
+    if shuffle_within_splits:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        perm_tr = torch.randperm(train_idx.numel(), generator=g)
+        perm_va = torch.randperm(val_idx.numel(), generator=g)
+        train_idx = train_idx[perm_tr]
+        val_idx   = val_idx[perm_va]
+
+    if train_idx.numel() == 0 or val_idx.numel() == 0:
+        raise RuntimeError(
+            f"Temporal split produced empty set(s): "
+            f"train={train_idx.numel()}, val={val_idx.numel()}. "
+            f"Check boundary_year={boundary_year} and your data years "
+            f"(min={int(years.min())}, max={int(years.max())})."
+        )
+    return train_idx, val_idx

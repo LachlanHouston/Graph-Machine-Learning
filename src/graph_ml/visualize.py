@@ -1,179 +1,289 @@
-import numpy as np
-import random
+import math
+import torch
 import networkx as nx
 import matplotlib.pyplot as plt
+from collections import defaultdict
 from matplotlib.lines import Line2D
 
-def hetero_to_nx_yelp_full(
-    data,
-    include_edge_labels: bool = True,
-    node_prefix: bool = True,
-) -> nx.Graph:
-    """
-    Convert PyG HeteroData to NetworkX including:
-      - user --reviews--> business  (with float stars if present)
-      - user --friends--> user
-    """
-    def ukey(i): return f"u:{int(i)}" if node_prefix else ("user", int(i))
-    def bkey(i): return f"b:{int(i)}" if node_prefix else ("business", int(i))
-
-    G = nx.Graph()
-    G.add_nodes_from((ukey(i), {"bipartite": 0, "ntype": "user"})
-                     for i in range(data["user"].num_nodes))
-    G.add_nodes_from((bkey(i), {"bipartite": 1, "ntype": "business"})
-                     for i in range(data["business"].num_nodes))
-
-    # reviews edges
-    rel = ("user","reviews","business")
-    ei = data[rel].edge_index
-    stars = getattr(data[rel], "stars", None)
-    ycls  = getattr(data[rel], "y", None)
-    if stars is not None:
-        s_np = stars.cpu().numpy()
-        for u, b, s in zip(ei[0].cpu().numpy(), ei[1].cpu().numpy(), s_np):
-            G.add_edge(ukey(u), bkey(b), etype="reviews", stars=float(s))
-    else:
-        ynp = ycls.cpu().numpy() if ycls is not None else None
-        for i, (u, b) in enumerate(zip(ei[0].cpu().numpy(), ei[1].cpu().numpy())):
-            s = ((ynp[i] + 2) / 2.0) if ynp is not None else None
-            G.add_edge(ukey(u), bkey(b), etype="reviews", stars=s)
-
-    # friends edges
-    if ("user","friends","user") in data.edge_types:
-        eif = data[("user","friends","user")].edge_index
-        for u, v in zip(eif[0].cpu().numpy(), eif[1].cpu().numpy()):
-            if u == v: 
-                continue
-            G.add_edge(ukey(u), ukey(v), etype="friends")
-
-    return G
-
-
-def sample_bipartite_subgraph(
-    G: nx.Graph,
-    max_users: int = 200,
-    max_businesses: int = 200,
-    seed: int = 69
-) -> nx.Graph:
-    rng = random.Random(seed)
-    users = [n for n, d in G.nodes(data=True) if d.get("bipartite") == 0]
-    biz   = [n for n, d in G.nodes(data=True) if d.get("bipartite") == 1]
-
-    users_sample = set(rng.sample(users, min(max_users, len(users))))
-    biz_sample   = set(rng.sample(biz,   min(max_businesses, len(biz))))
-
-    keep = users_sample | biz_sample
-    H = G.subgraph(keep).copy()
-
-    # Optionally, drop isolated nodes (no edges after sampling)
-    H.remove_nodes_from(list(nx.isolates(H)))
-    return H
-
-def ego_subgraph(G: nx.Graph, center_node: str, radius: int = 1) -> nx.Graph:
-    return nx.ego_graph(G, center_node, radius=radius, undirected=True)
-
-def yelp_bipartite_pos_pretty(G, jitter=0.06, seed=42):
-    """
-    Two-column bipartite layout but prettier:
-    - users at x≈0, businesses at x≈1 (small x jitter)
-    - y positions sorted by degree (denser areas get space)
-    """
-    rng = np.random.default_rng(seed)
-    users = [n for n, d in G.nodes(data=True) if d.get("ntype") == "user"]
-    biz   = [n for n, d in G.nodes(data=True) if d.get("ntype") == "business"]
-
-    # order by degree (spread high-degree nodes out)
-    users_sorted = sorted(users, key=lambda n: G.degree(n), reverse=True)
-    biz_sorted   = sorted(biz,   key=lambda n: G.degree(n), reverse=True)
-
-    def spaced_y(nodes):
-        # evenly spaced y in [-1,1], then small jitter
-        m = max(1, len(nodes))
-        y = np.linspace(-1, 1, m)
-        y += rng.normal(0, 0.02, size=m)
-        return y
-
-    yu = spaced_y(users_sorted)
-    yb = spaced_y(biz_sorted)
-
-    pos = {}
-    for i, n in enumerate(users_sorted):
-        pos[n] = np.array([0.0 + rng.normal(0, jitter), yu[i]])
-    for i, n in enumerate(biz_sorted):
-        pos[n] = np.array([1.0 + rng.normal(0, jitter), yb[i]])
-    return pos
-
-def draw_yelp_layers_pretty(
-    G: nx.Graph,
-    node_size_users=20,
-    node_size_biz=28,
-    alpha_reviews=0.55,
-    alpha_friends=0.12,
-    max_review_edges=None,     # e.g. 40_000 to downsample edges for speed
-    max_friend_edges=None,     # e.g. 10_000
+def visualize_link_batch(
+    batch,
+    highlight_rel=("user", "reviews", "business"),
+    max_nodes=800,
+    with_labels=False,
+    node_size_scale=280.0,
+    figsize=(12, 9),
     seed=42,
+    save_path=None,
+    annotate_targets=True,          # label target edges with year
+    annotate_sample_k=0,            # also label up to k random edges per relation
+    year_fmt=lambda y: str(int(y)), # how to format year labels
 ):
-    rng = np.random.default_rng(seed)
-    users = [n for n, d in G.nodes(data=True) if d.get("ntype") == "user"]
-    biz   = [n for n, d in G.nodes(data=True) if d.get("ntype") == "business"]
+    """
+    Draw the hetero subgraph with clear type styling + optional edge-year labels.
+    """
+    # -------- palettes & styles --------
+    node_palette = {
+        "user":     "#1f77b4",
+        "business": "#ff7f0e",
+    }
+    node_markers = {
+        "user": "o",
+        "business": "s",
+    }
+    edge_palette = {
+        ("user","reviews","business"):     "#4c78a8",
+        ("user","friends","user"):         "#54a24b",
+    }
+    edge_styles = {
+        ("user","reviews","business"):     "solid",
+        ("user","friends","user"):         (0, (1, 3)),
+    }
+    highlight_color = "#d62728"
+    highlight_width = 3.2
 
-    pos = yelp_bipartite_pos_pretty(G, seed=seed)
+    # -------- build graph --------
+    G = nx.MultiDiGraph()
+    node_id_maps = {}
+    deg = defaultdict(int)
 
-    # Partition edge lists
-    review_edges  = [(u, v) for u, v, d in G.edges(data=True) if d.get("etype") == "reviews"]
-    friend_edges  = [(u, v) for u, v, d in G.edges(data=True) if d.get("etype") == "friends"]
+    total_nodes = sum(int(getattr(batch[nt], "num_nodes", 0)) for nt in batch.node_types)
+    take_ratio = 1.0 if total_nodes <= max_nodes else max_nodes / float(total_nodes)
 
-    # Optional downsampling (visual sanity on large graphs)
-    if max_review_edges is not None and len(review_edges) > max_review_edges:
-        review_edges = list(rng.choice(review_edges, size=max_review_edges, replace=False))
-    if max_friend_edges is not None and len(friend_edges) > max_friend_edges:
-        friend_edges = list(rng.choice(friend_edges, size=max_friend_edges, replace=False))
+    for ntype in batch.node_types:
+        num = int(getattr(batch[ntype], "num_nodes", 0))
+        if num == 0: 
+            continue
+        ids = torch.arange(num)
+        if take_ratio < 1.0:
+            k = max(1, int(math.ceil(num * take_ratio)))
+            ids = ids[torch.randperm(num)[:k]]
+        node_id_maps[ntype] = {int(i): f"{ntype[:3]}:{int(i)}" for i in ids.tolist()}
+        for i in ids.tolist():
+            G.add_node((ntype, i), ntype=ntype)
 
-    plt.figure(figsize=(12, 8))
+    # add edges
+    # keep a per-relation list aligning edges to the source .time tensor indices
+    rel_edges = {et: [] for et in batch.edge_types}
+    for et in batch.edge_types:
+        ei = batch[et].edge_index
+        if ei.numel() == 0: 
+            continue
+        src_type, _, dst_type = et
+        allowed_src = node_id_maps.get(src_type, {})
+        allowed_dst = node_id_maps.get(dst_type, {})
+        s_list, d_list = ei[0].tolist(), ei[1].tolist()
+        for idx, (s, d) in enumerate(zip(s_list, d_list)):
+            if s in allowed_src and d in allowed_dst:
+                u = (src_type, s); v = (dst_type, d)
+                G.add_edge(u, v, etype=et, eidx=idx)  # store original edge idx
+                rel_edges[et].append(((u, v), idx))
+                deg[u] += 1; deg[v] += 1
 
-    # Nodes
-    n_users = nx.draw_networkx_nodes(G, pos, nodelist=users, node_size=node_size_users)
-    n_biz   = nx.draw_networkx_nodes(G, pos, nodelist=biz,   node_size=node_size_biz, node_shape="s")
+    # node sizes
+    sizes = [max(60.0, math.sqrt(max(1, deg[n])) * node_size_scale) for n in G.nodes]
 
-    # Reviews: color by stars (float), draw with slight curvature
-    if review_edges:
-        stars = [G.edges[e].get("stars", 3.0) for e in review_edges]
-        e_reviews = nx.draw_networkx_edges(
-            G, pos, edgelist=review_edges, width=0.6, alpha=alpha_reviews,
-            edge_color=stars, edge_cmap=plt.cm.get_cmap(), edge_vmin=1.0, edge_vmax=5.0,
-            connectionstyle="arc3,rad=0.08"  # subtle curve to reduce overlap
+    # layout
+    k = None if len(G) < 200 else 1 / math.sqrt(len(G))
+    pos = nx.spring_layout(G, seed=seed, k=k)
+
+    plt.figure(figsize=figsize)
+
+    # nodes (distinct by type)
+    for ntype in batch.node_types:
+        nodelist = [n for n in G.nodes if n[0] == ntype]
+        if not nodelist: 
+            continue
+        idxs = [list(G.nodes).index(n) for n in nodelist]
+        nsizes = [sizes[i] for i in idxs]
+        nx.draw_networkx_nodes(
+            G, pos,
+            nodelist=nodelist,
+            node_size=nsizes,
+            node_color=node_palette.get(ntype, "#7f7f7f"),
+            node_shape=node_markers.get(ntype, "o"),
+            alpha=0.9,
+            linewidths=0.8,
+            edgecolors="#ffffff",
         )
-        cbar = plt.colorbar(e_reviews)
-        cbar.set_label("Review stars")
-    # Friends: faint gray curves
-    if friend_edges:
+
+    # edges (per relation)
+    for et in batch.edge_types:
+        edges = [(u, v) for (u, v, d) in G.edges(data=True) if d.get("etype") == et]
+        if not edges: 
+            continue
         nx.draw_networkx_edges(
-            G, pos, edgelist=friend_edges, width=0.45, alpha=alpha_friends,
-            edge_color="gray", connectionstyle="arc3,rad=0.08"
+            G, pos, edgelist=edges,
+            width=1.1, alpha=0.5,
+            edge_color=edge_palette.get(et, "#999999"),
+            style=edge_styles.get(et, "solid"),
+            arrows=False,
         )
 
-    # Legends (proxy artists)
-    legend_elems = [
-        Line2D([0], [0], marker='o', color='w', label='Users',
-               markerfacecolor=n_users.get_facecolor()[0], markersize=np.sqrt(node_size_users)),
-        Line2D([0], [0], marker='s', color='w', label='Businesses',
-               markerfacecolor=n_biz.get_facecolor()[0], markersize=np.sqrt(node_size_biz)),
-        Line2D([0], [0], color='gray', lw=2, alpha=0.5, label='Friends'),
-        Line2D([0], [0], color='k', lw=2, alpha=0.6, label='Reviews (color = stars)'),
+    if annotate_sample_k and annotate_sample_k > 0:
+        for et in batch.edge_types:
+            if not hasattr(batch[et], "time") or batch[et].time is None:
+                continue
+            times = batch[et].time
+            if times.dim() > 1:
+                times = times.view(-1)
+            pairs = rel_edges.get(et, [])
+            if not pairs:
+                continue
+            k = min(annotate_sample_k, len(pairs))
+            perm = torch.randperm(len(pairs))[:k].tolist()
+            for j in perm:
+                (u, v), eidx = pairs[j]
+                t = times[eidx].item()
+                mid = (pos[u] + pos[v]) / 2.0
+                plt.text(
+                    mid[0], mid[1], year_fmt(t),
+                    fontsize=8,
+                    ha="center", va="center",
+                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=0.4),
+                    color=edge_palette.get(et, "#333333"),
+                )
+
+    if highlight_rel in batch.edge_types and hasattr(batch[highlight_rel], "edge_label_index"):
+        el = batch[highlight_rel].edge_label_index  # [2, M]
+        if el is not None and el.numel() > 0:
+            src_type, _, dst_type = highlight_rel
+            allowed_src = node_id_maps.get(src_type, {})
+            allowed_dst = node_id_maps.get(dst_type, {})
+            hl_edges = []
+            for s, d in zip(el[0].tolist(), el[1].tolist()):
+                if s in allowed_src and d in allowed_dst:
+                    hl_edges.append(((src_type, s), (dst_type, d)))
+
+            if hl_edges:
+                # draw highlighted edges (thicker/red)
+                nx.draw_networkx_edges(
+                    G, pos, edgelist=hl_edges, width=3.2, alpha=0.95,
+                    edge_color="#d62728", arrows=False
+                )
+
+                # ALWAYS annotate: use edge_label_time if available
+                tvec = getattr(batch[highlight_rel], "edge_label_time", None)
+                if tvec is not None:
+                    tvec = tvec.view(-1) if tvec.dim() > 1 else tvec
+                    L = min(len(hl_edges), tvec.numel())
+                    for ((u, v), t) in zip(hl_edges[:L], tvec[:L].tolist()):
+                        mid = (pos[u] + pos[v]) / 2.0
+                        plt.text(
+                            mid[0], mid[1], year_fmt(t),
+                            fontsize=9, fontweight="bold",
+                            ha="center", va="center",
+                            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=0.5),
+                            color="#d62728",
+                        )
+
+    # labels (optional)
+    if with_labels and len(G) <= 200:
+        labels = {n: f"{n[0][:3]}:{n[1]}" for n in G.nodes}
+        nx.draw_networkx_labels(G, pos, labels=labels, font_size=8, alpha=0.9)
+
+    # legend
+    node_handles = [
+        Line2D([0], [0], marker=marker, color="none",
+               markerfacecolor=node_palette.get(nt, "#7f7f7f"),
+               markeredgecolor="#ffffff", markeredgewidth=0.8,
+               markersize=10, label=nt)
+        for nt, marker in node_markers.items()
+        if any(n[0] == nt for n in G.nodes)
     ]
-    plt.legend(handles=legend_elems, frameon=False, loc="upper center", ncol=2)
+    edge_handles = [
+        Line2D([0], [0], color=edge_palette.get(et, "#999999"),
+               linestyle=edge_styles.get(et, "solid"), linewidth=2, label=str(et))
+        for et in batch.edge_types
+        if any(d.get("etype")==et for *_, d in G.edges(data=True))
+    ]
+    handles = node_handles + edge_handles + [Line2D([0],[0], color=highlight_color, linewidth=3, label="target edges")]
+    if handles:
+        plt.legend(handles=handles, fontsize=9, frameon=False, loc="upper right")
 
     plt.axis("off")
-    plt.title("Yelp graph: Users ↔ Businesses (reviews) + User–User (friends)")
     plt.tight_layout()
-    plt.show()
+    if save_path:
+        plt.savefig(save_path, dpi=220, bbox_inches="tight")
+        print(f"Saved to {save_path}")
+    else:
+        plt.show()
 
-def draw_degree_hist(G: nx.Graph):
-    degs = [d for _, d in G.degree()]
-    plt.figure(figsize=(8, 5))
-    plt.hist(degs, bins=50)
-    plt.xlabel("Degree")
-    plt.ylabel("Count")
-    plt.title("Degree distribution (sampled)")
-    plt.tight_layout()
-    plt.show()    
+
+if __name__ == "__main__":
+    from torch_geometric.loader import LinkNeighborLoader
+    from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year
+
+    rel = ("user", "reviews", "business")
+
+    data = load_yelp_as_hetero('data/raw/', max_reviews=250_000, 
+                               min_review_len=5, seed=52, 
+                               cache=True, cache_subdir="processed", 
+                               include_user_friends=True, max_friends_per_user=50)
+    
+    num_classes = 1
+    
+    train_idx, val_idx = split_edge_indices_by_year(
+        data, rel=rel, boundary_year=2017, include_boundary_in_train=False
+    )
+
+
+    num_neighbors = {
+        ("user","reviews","business"): [8,8],
+        ("business","rev_reviews","user"): [16,16],
+        ("user","friends","user"): [4,4],   # much smaller
+    }
+
+    stars = data[rel].edge_label           # [E]
+    years = data[rel].time.squeeze()
+
+    train_label = stars[train_idx] # [Ntr, 2]
+    val_label   = stars[val_idx]
+
+    common_kwargs = dict(
+        data=data,
+        num_neighbors=num_neighbors,
+        batch_size=64,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        prefetch_factor=None,
+    )
+
+    train_loader = LinkNeighborLoader(
+        **common_kwargs,
+        edge_label_index=(rel, data[rel].edge_index[:, train_idx]),
+        edge_label= train_label,
+        edge_label_time=years[train_idx],
+        time_attr="time"
+    )
+
+    val_loader = LinkNeighborLoader(
+        **{**common_kwargs, "shuffle": False},
+        edge_label_index=(rel, data[rel].edge_index[:, val_idx]),
+        edge_label=val_label,
+        edge_label_time=years[val_idx],
+        time_attr="time",
+    )
+
+    for batch in train_loader:
+        visualize_link_batch(
+            batch.cpu(), 
+            highlight_rel=("user","reviews","business"),
+            annotate_targets=True,     # show years on target edges
+            annotate_sample_k=10,      # plus 10 random edges per relation
+            year_fmt=lambda y: str(int(y)),
+            save_path="reports/figures/yelp_train_batch.png"
+        )
+        break
+
+    for batch in val_loader:
+        visualize_link_batch(
+            batch.cpu(), 
+            highlight_rel=("user","reviews","business"),
+            annotate_targets=True,     # show years on target edges
+            annotate_sample_k=10,      # plus 10 random edges per relation
+            year_fmt=lambda y: str(int(y)),
+            save_path="reports/figures/yelp_val_batch.png"
+        )
+        break

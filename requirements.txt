@@ -1,8 +1,0 @@
-invoke==2.2.0
-matplotlib==3.10.6
-networkx==3.5
-numpy==2.3.3
-texttable==1.7.0
-torch==2.5.1
-torch_geometric==2.6.1
-tqdm==4.67.1

@@ -6,16 +6,36 @@ from torch_geometric.nn import HGTConv
 from torch_geometric.data import HeteroData
 from typing import Tuple
 
+class RelTemporalEncoding(nn.Module):
+    """
+    Encode scalar(s) Δt with a small learnable cosine basis, as in pyHGT.
+    Input: y in R^{E, d_in} (here d_in=2: Δt_u, Δt_b)
+    Output: R^{E, d_out} with tiny dimension.
+    """
+    def __init__(self, d_in=2, n_freq=4, d_out=16):
+        super().__init__()
+        # One frequency vector per input channel
+        self.freq = nn.Parameter(torch.randn(d_in, n_freq))   # learnable "w"
+        self.phase= nn.Parameter(torch.zeros(d_in, n_freq))   # learnable "phi"
+        self.proj = nn.Linear(d_in * n_freq, d_out)
+
+    def forward(self, y):  # y: [E, d_in]
+        # expand: [E, d_in, 1] -> broadcast with [d_in, n_freq]
+        # result: [E, d_in, n_freq]
+        w = y.unsqueeze(-1) * self.freq + self.phase
+        c = torch.cos(w)                       # cosine basis
+        c = c.flatten(1)                       # [E, d_in*n_freq]
+        return self.proj(c)                    # [E, d_out]
+
 class EdgeHGT(nn.Module):
     def __init__(self, metadata, hidden_dim=128, num_layers=2, heads=2, dropout=0.1,
-                 use_pair_interactions: bool = True, edge_feat_dim: int = 1):
+                 use_pair_interactions=True, time_out=16):
         super().__init__()
         node_types, edge_types = metadata
         self.node_types = node_types
         self.edge_types = edge_types
         self.hidden_dim = hidden_dim
         self.use_pair_interactions = use_pair_interactions
-        self.edge_feat_dim = edge_feat_dim  # e.g., 1 for year
 
         # Featureless nodes → id embeddings
         self.embeds = nn.ModuleDict()
@@ -34,8 +54,7 @@ class EdgeHGT(nn.Module):
             ) for _ in range(num_layers)
         ])
 
-        # Project edge features to hidden, so scales match
-        self.edge_proj = nn.Linear(edge_feat_dim, hidden_dim)
+        self.time_enc = RelTemporalEncoding(d_in=2, n_freq=4, d_out=time_out)
 
         self._global_num_nodes = {}
 
@@ -70,33 +89,29 @@ class EdgeHGT(nn.Module):
         # Pair endpoints for labeled edges
         eidx: torch.Tensor = batch[rel].edge_label_index
         u_loc, v_loc = eidx[0], eidx[1]
-        hu = x_dict[rel[0]][u_loc]  # user emb
-        hv = x_dict[rel[2]][v_loc]  # business emb
-
-        # Core pair representation
+        hu = x_dict[rel[0]][u_loc]; hv = x_dict[rel[2]][v_loc]
         parts = [hu, hv]
-
         if self.use_pair_interactions:
             parts += [torch.abs(hu - hv), hu * hv]
 
-        year_feat = batch[rel].edge_label[:, 1:2].to(hu.dtype)
-        year_emb = self.edge_proj(year_feat)
-        parts.append(year_emb)
+        # dt = batch[rel].edge_attr[:, :2].to(hu.dtype)     # [E,2] = (Δt_u, Δt_b)
+        # t_emb = self.time_enc(dt)                         # [E,time_out]
+        # parts.append(t_emb)
 
         return torch.cat(parts, dim=-1)
     
 class EdgeClassifier(nn.Module):
-    def __init__(self, hidden_dim=128, num_classes=5):
+    def __init__(self, hidden_dim=128, num_classes=5, use_pair_interactions=True, time_out=0):
         super().__init__()
-        in_dim = 5*hidden_dim
+        base = 2*hidden_dim
+        inter = 2*hidden_dim if use_pair_interactions else 0
+        in_dim = base + inter + time_out
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, num_classes)
         )
-
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, edge_repr: Tensor) -> Tensor:
         return self.mlp(edge_repr).squeeze(-1)

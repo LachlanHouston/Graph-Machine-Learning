@@ -13,7 +13,7 @@ from tqdm import tqdm
 from torch_geometric.loader import LinkNeighborLoader
 
 # Package modules
-from graph_ml.data import load_yelp_as_hetero, split_edge_indices
+from graph_ml.data import load_yelp_as_hetero, split_edge_indices, split_edge_indices_by_year
 from graph_ml.model import EdgeHGT, EdgeClassifier
 from graph_ml.utils import args_print, get_n_params, set_seed
 
@@ -22,73 +22,6 @@ try:
     import wandb
 except ImportError:
     wandb = None
-
-def confusion_matrix_torch(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """
-    y_true, y_pred: int tensors of shape [N] with labels in {1..num_classes}
-    returns: [C, C] where rows = true, cols = pred
-    """
-    y_true = y_true.long().clamp(1, num_classes)
-    y_pred = y_pred.long().clamp(1, num_classes)
-    idx = (y_true - 1) * num_classes + (y_pred - 1)
-    cm = torch.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
-    return cm
-
-# Ordinal Regression Loss
-class OrdinalRegLoss(nn.Module):
-    """
-    Ordinal regression loss (Korn et al. encoding).
-    Targets are integer class labels in [0, num_classes-1].
-    For each y, the target vector is [1, 1, ..., 1, 0, 0, ...] (inclusive up to y).
-    Computes MSE between preds and the encoded target, summed over classes.
-
-    Args:
-        num_classes (int): number of ordinal categories.
-        reduction (str): 'none' | 'mean' | 'sum' over the batch.
-    """
-    def __init__(self, num_classes: int = 5, reduction: str = 'mean'):
-        super().__init__()
-        if reduction not in ('none', 'mean', 'sum'):
-            raise ValueError("reduction must be 'none', 'mean', or 'sum'")
-        self.num_classes = num_classes
-        self.reduction = reduction
-        self.mse = nn.MSELoss(reduction='none')
-
-    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        preds:   [N, C] (typically probabilities in [0,1], or any continuous scores)
-        targets: [N] or [N,1] integer labels in [0, C-1]
-        """
-        if preds.dim() != 2:
-            raise ValueError(f"`preds` must be [N, C], got shape {tuple(preds.shape)}")
-        N, C = preds.shape
-        if C != self.num_classes:
-            raise ValueError(f"preds.shape[1] ({C}) != num_classes ({self.num_classes})")
-
-        # Ensure targets are shape [N] and long dtype
-        if targets.dim() > 1:
-            targets = targets.squeeze(-1)
-        targets = targets.to(dtype=torch.long)
-
-        if (targets < 0).any() or (targets >= self.num_classes+1).any():
-            raise ValueError("targets contain indices outside [0, num_classes-1]")
-
-        device = preds.device
-        class_range = torch.arange(self.num_classes, device=device).unsqueeze(0) + 1 # [1, C]
-        y = targets.view(-1, 1)  # [N, 1]
-
-        # Build ordinal target: ones up to and including y, zeros after
-        modified_target = (class_range <= y).to(dtype=preds.dtype)  # [N, C]
-
-        # Per-sample loss = sum over classes of MSE
-        per_sample = self.mse(preds, modified_target).sum(dim=1)  # [N]
-
-        if self.reduction == 'none':
-            return per_sample
-        elif self.reduction == 'mean':
-            return per_sample.mean()
-        else:  # 'sum'
-            return per_sample.sum()
         
 def main():
     parser = argparse.ArgumentParser(description='Training GNN')
@@ -96,13 +29,13 @@ def main():
     # System
     parser.add_argument('--data_dir', type=str, default='data/raw/',
                         help='The address of preprocessed graph.')
-    parser.add_argument('--model_dir', type=str, default='models/test.pt',
+    parser.add_argument('--model_dir', type=str, default=f'models/run_{int(time.time())}.pt',
                         help='The address for storing the trained models.')
     parser.add_argument('--cuda', type=int, default=0, help='Available GPU ID')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
     # Data
-    parser.add_argument("--max_reviews", type=int, default=100_000)
+    parser.add_argument("--max_reviews", type=int, default=250_000)
     parser.add_argument("--min_review_len", type=int, default=5)
     parser.add_argument("--use_text_edge_attr", action="store_true", default=False)
     parser.add_argument("--tfidf_max_tokens", type=int, default=5000)
@@ -115,13 +48,13 @@ def main():
     parser.add_argument('--n_hid', type=int, default=512, help='Hidden dim')
     parser.add_argument('--n_heads', type=int, default=8, help='Attention heads')
     parser.add_argument('--n_layers', type=int, default=4, help='GNN layers')
-    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout ratio')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout ratio')
     parser.add_argument('--n_epoch', type=int, default=3, help='Epochs')
     parser.add_argument('--n_batch', type=int, default=32, help='Batches (sampled graphs) per epoch')
     parser.add_argument('--clip', type=float, default=1.0, help='Gradient norm clipping')
 
     # Optimizer
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
 
     # WandB
@@ -150,9 +83,10 @@ def main():
     
     num_classes = 1
     
-    E = data[rel].edge_index.size(1)
+    train_idx, val_idx = split_edge_indices_by_year(
+        data, rel=rel, boundary_year=2017, include_boundary_in_train=True
+    )
 
-    train_idx, val_idx, test_idx = split_edge_indices(E, val_ratio=0.1, test_ratio=0.1, seed=42)
 
     num_neighbors = {
         ("user","reviews","business"): [16,16],
@@ -174,21 +108,25 @@ def main():
     )
 
     stars = data[rel].edge_label           # [E]
-    yearx = data[rel].edge_attr.squeeze(1) # [E] years are normalized
+    years = data[rel].time.squeeze()
 
-    train_label = torch.stack([stars[train_idx], yearx[train_idx]], dim=1)  # [Ntr, 2]
-    val_label   = torch.stack([stars[val_idx],   yearx[val_idx]],   dim=1)
-    test_label  = torch.stack([stars[test_idx],  yearx[test_idx]],  dim=1)
+    train_label = stars[train_idx] # [Ntr, 2]
+    val_label   = stars[val_idx]
 
     train_loader = LinkNeighborLoader(
         **common_kwargs,
         edge_label_index=(rel, data[rel].edge_index[:, train_idx]),
-        edge_label=train_label,  # 2 columns now!
+        edge_label= train_label,
+        edge_label_time=years[train_idx],
+        time_attr="time"
     )
+
     val_loader = LinkNeighborLoader(
         **{**common_kwargs, "shuffle": False},
         edge_label_index=(rel, data[rel].edge_index[:, val_idx]),
-        edge_label=val_label,
+        edge_label= val_label,
+        edge_label_time=years[val_idx],
+        time_attr="time"
     )
 
     gnn = EdgeHGT(metadata=data.metadata(),
@@ -206,14 +144,14 @@ def main():
 
     model = torch.nn.Sequential(gnn, classifier).to(device)
 
-    criterion = torch.nn.MSELoss()
+    criterion = torch.nn.L1Loss()
 
     print('Number of Parameters for Total model: %d' % get_n_params(model))
     param_optimizer = list(model.named_parameters())
 
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         [
             {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
             {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
@@ -250,7 +188,7 @@ def main():
         batch_bar = tqdm(total=args.n_batch, desc="Train batches", leave=False)
         for steps, batch in zip(range(args.n_batch), train_loader):
             batch = batch.to(device)
-            y = batch[rel].edge_label[:, 0].float()     # target stars
+            y = batch[rel].edge_label.float()     # target stars
 
             optimizer.zero_grad()
 
@@ -269,45 +207,56 @@ def main():
                 wandb.log({'train/loss': loss.item()}, step=train_step)
             train_step += 1
 
+            break
+
         batch_bar.close()
         avg_loss = total_loss / max(1, steps + 1)
 
         # Validation
         model.eval()
         y_true, y_pred = [], []
+        val_loss = 0.0
+        val_rmse = 0.0
+        steps = 0
+
         with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             for batch in tqdm(val_loader, desc="Val", leave=False, dynamic_ncols=True):
                 batch = batch.to(device, non_blocking=True)
-                y = batch[rel].edge_label[:, 0].float()     # target stars
+                y = batch[rel].edge_label.float()     # target stars
 
                 preds = model(batch).view(-1)
+
+                val_loss += criterion(preds, y).item()
+                val_rmse += torch.sqrt(F.mse_loss(preds, y)).item()
+                steps += 1
+
                 y_true.append(y)
                 y_pred.append(preds)
+
+        val_loss /= max(1, steps)
+        val_rmse /= max(1, steps)
 
         y_true = torch.cat(y_true).float()
         y_pred = torch.cat(y_pred).float()
 
-        val_loss = criterion(y_pred, y_true)
-        val_rmse = torch.sqrt(F.mse_loss(y_pred, y_true))
-
         # Ensure integers on CPU for metrics/logging
         y_true_i = y_true.round().long().cpu()
         y_pred_i = y_pred.clamp(1, 5).round().long().cpu()
-
-        cm_plot = wandb.plot.confusion_matrix(
-                preds=y_pred_i.tolist(),
-                y_true=y_true_i.tolist(),
-            )
 
         if val_rmse < best_val:
             best_val = val_rmse
             os.makedirs(os.path.dirname(args.model_dir), exist_ok=True)
             torch.save(model.state_dict(), args.model_dir)
 
-        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss.item():.4f}', 'val_rmse': f'{val_rmse.item():.4f}'})
+        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}'})
 
         if run is not None:
-            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'val/loss': val_loss.item(), 'val/rmse': val_rmse.item(), "val/confusion_matrix": cm_plot}, step=train_step)
+            cm_plot = wandb.plot.confusion_matrix(
+                preds=y_pred_i.tolist(),
+                y_true=y_true_i.tolist(),
+            )
+
+            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'val/loss': val_loss, 'val/rmse': val_rmse, "val/confusion_matrix": cm_plot}, step=train_step)
 
 if __name__ == "__main__":
     main()
