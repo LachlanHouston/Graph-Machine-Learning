@@ -9,6 +9,36 @@ from torch import Tensor
 from torch_geometric.data import HeteroData
 from graph_ml.utils import set_seed
 
+import re
+import gensim.downloader as api
+
+_W2V = None
+_W2V_DIM = 300
+
+def _get_w2v():
+    global _W2V
+    if _W2V is None:
+        # 'word2vec-google-news-300' is large (~1.5GB). Alternatives:
+        #  - 'glove-wiki-gigaword-300' (300d)
+        #  - 'glove-wiki-gigaword-200' (200d)
+        _W2V = api.load('word2vec-google-news-300')
+    return _W2V
+
+_token_pat = re.compile(r"[A-Za-z']+")
+def _simple_tokenize(s: str):
+    return [t.lower() for t in _token_pat.findall(s)]
+
+def _mean_w2v(tokens, w2v, dim: int):
+    vec = np.zeros(dim, dtype=np.float32)
+    count = 0
+    for t in tokens:
+        if t in w2v.key_to_index:
+            vec += w2v.get_vector(t)
+            count += 1
+    if count > 0:
+        vec /= count
+    return vec
+
 def _file_fingerprint(p: Path) -> str:
     st = p.stat()
     return f"{st.st_size}-{st.st_mtime_ns}"
@@ -62,11 +92,14 @@ def load_yelp_as_hetero(
         if not f.exists():
             raise FileNotFoundError(f"Missing file: {f}")
 
-    # ----- build fresh -----
+        # ----- build fresh -----
     set_seed(seed)
+    w2v = _get_w2v()
+    w2v_dim = _W2V_DIM
 
-    # Load reviews (subset)
-    rev_rows: List[Tuple[str, str, float]] = []
+    rev_rows: List[Tuple[str, str, float, int]] = []
+    rev_embs: List[np.ndarray] = []  # NEW
+
     with fp_rev.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             if max_reviews is not None and i >= max_reviews:
@@ -84,10 +117,14 @@ def load_yelp_as_hetero(
                 year = int(date_str[:4]) if len(date_str) >= 4 else -1
             except Exception:
                 year = -1
-            if year <= 0:
-                pass
 
             rev_rows.append((u, b, stars, year))
+
+            # --- NEW: compute mean word2vec for this review ---
+            toks = _simple_tokenize(txt)
+            emb = _mean_w2v(toks, w2v, w2v_dim)   # np.float32 [300]
+            rev_embs.append(emb)
+
     if not rev_rows:
         raise RuntimeError("No reviews loaded. Increase max_reviews or lower min_review_len.")
 
@@ -106,11 +143,15 @@ def load_yelp_as_hetero(
             if bid:
                 biz_ids.add(bid)
 
-    # Keep only overlapping reviews
-    rev_rows = [(u, b, s, y) for (u, b, s, y) in rev_rows
+    # Keep only overlapping reviews (and aligned embeddings)
+    kept = [(u, b, s, y, e) for (u,b,s,y), e in zip(rev_rows, rev_embs)
             if (u in user_ids and b in biz_ids)]
-    if not rev_rows:
+    if not kept:
         raise RuntimeError("No overlapping user/business ids with reviews.")
+
+    rev_rows = [(u,b,s,y) for (u,b,s,y,_) in kept]
+    rev_embs = [e for (*_, e) in kept]
+
 
     # Index maps from review subgraph
     uniq_users = sorted({u for (u, _, _, _) in rev_rows})
@@ -139,10 +180,17 @@ def load_yelp_as_hetero(
     edge_index_reviews = torch.tensor(np.vstack([u_idx, b_idx]), dtype=torch.long)
     data[rel_reviews].edge_index = edge_index_reviews
     data[rel_reviews].edge_label = torch.tensor(stars, dtype=torch.long)
-    data[rel_reviews].time = torch.tensor(years[:, None], dtype=torch.long)
+    data[rel_reviews].time = torch.tensor(years, dtype=torch.long).view(-1)
 
-    data[("business", "rev_reviews", "user")].edge_index = edge_index_reviews.flip(0)
-    data[("business", "rev_reviews", "user")].time = data[rel_reviews].time
+    # --- NEW: word2vec edge features [E, 300] ---
+    edge_attr_w2v = torch.tensor(np.stack(rev_embs, axis=0), dtype=torch.float32)
+    data[rel_reviews].edge_attr = edge_attr_w2v
+
+    # reverse edge mirrors features/time
+    rel_rev = ("business", "rev_reviews", "user")
+    data[rel_rev].edge_index = edge_index_reviews.flip(0)
+    data[rel_rev].time = data[rel_reviews].time
+    data[rel_rev].edge_attr = data[rel_reviews].edge_attr
 
     if include_user_friends:
         # Collect friendships only among users that appear in the review subgraph

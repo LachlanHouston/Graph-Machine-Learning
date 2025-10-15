@@ -22,7 +22,14 @@ try:
     import wandb
 except ImportError:
     wandb = None
+
+def ordinal_targets(y):
+    B = y.size(0)
+    k = torch.arange(1, 5, device=y.device).unsqueeze(0).expand(B, -1)
+    return (y.unsqueeze(1) > k).float()
         
+use_amp = False
+
 def main():
     parser = argparse.ArgumentParser(description='Training GNN')
 
@@ -46,16 +53,16 @@ def main():
 
     # Model
     parser.add_argument('--n_hid', type=int, default=512, help='Hidden dim')
-    parser.add_argument('--n_heads', type=int, default=8, help='Attention heads')
+    parser.add_argument('--n_heads', type=int, default=4, help='Attention heads')
     parser.add_argument('--n_layers', type=int, default=4, help='GNN layers')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout ratio')
-    parser.add_argument('--n_epoch', type=int, default=3, help='Epochs')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout ratio')
+    parser.add_argument('--n_epoch', type=int, default=10, help='Epochs')
     parser.add_argument('--n_batch', type=int, default=32, help='Batches (sampled graphs) per epoch')
     parser.add_argument('--clip', type=float, default=1.0, help='Gradient norm clipping')
 
     # Optimizer
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.0002, help='Weight decay')
 
     # WandB
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
@@ -81,7 +88,7 @@ def main():
                                cache=True, cache_subdir="processed", 
                                include_user_friends=True, max_friends_per_user=50)
     
-    num_classes = 1
+    num_classes = 4
     
     train_idx, val_idx = split_edge_indices_by_year(
         data, rel=rel, boundary_year=2017, include_boundary_in_train=True
@@ -107,10 +114,10 @@ def main():
         prefetch_factor=prefetch_factor,
     )
 
-    stars = data[rel].edge_label           # [E]
+    stars = data[rel].edge_label
     years = data[rel].time.squeeze()
 
-    train_label = stars[train_idx] # [Ntr, 2]
+    train_label = stars[train_idx]
     val_label   = stars[val_idx]
 
     train_loader = LinkNeighborLoader(
@@ -129,22 +136,27 @@ def main():
         time_attr="time"
     )
 
-    gnn = EdgeHGT(metadata=data.metadata(),
-                          hidden_dim=args.n_hid,
-                          num_layers=args.n_layers,
-                          heads=args.n_heads,
-                          dropout=args.dropout).to(device)
-    
+    gnn = EdgeHGT(
+        metadata=data.metadata(),
+        hidden_dim=args.n_hid,
+        num_layers=args.n_layers,
+        heads=args.n_heads,
+        dropout=args.dropout
+    ).to(device)
+            
     gnn.set_num_nodes({
         "user": int(data["user"].num_nodes),
         "business": int(data["business"].num_nodes),
     })
     
-    classifier = EdgeClassifier(hidden_dim=args.n_hid, num_classes=num_classes).to(device)
+    classifier = EdgeClassifier(
+        hidden_dim=args.n_hid,
+        num_classes=num_classes,
+        time_out=16,                      # <-- must match EdgeHGT(..., time_out=16)
+        use_pair_interactions=True
+    ).to(device)
 
     model = torch.nn.Sequential(gnn, classifier).to(device)
-
-    criterion = torch.nn.L1Loss()
 
     print('Number of Parameters for Total model: %d' % get_n_params(model))
     param_optimizer = list(model.named_parameters())
@@ -174,6 +186,11 @@ def main():
             )
             wandb.watch(model, log="gradients")
 
+    y_train_all = data[rel].edge_label[train_idx].to(torch.long)
+    with torch.no_grad():
+        pos = torch.stack([(y_train_all > k).float().mean() for k in range(1,5)])
+    pos_w = ((1 - pos) / (pos + 1e-6)).to(device)  # shape [4], used for BCE logits
+
     best_val = float("inf")
     train_step = 0
 
@@ -188,15 +205,18 @@ def main():
         batch_bar = tqdm(total=args.n_batch, desc="Train batches", leave=False)
         for steps, batch in zip(range(args.n_batch), train_loader):
             batch = batch.to(device)
-            y = batch[rel].edge_label.float()     # target stars
+            y_train = batch[rel].edge_label.float()     # target stars
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                preds = model(batch).view(-1)
-                loss = criterion(preds, y)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits = model(batch)
+                t = ordinal_targets(y_train)              # [B,4]
+                loss = F.binary_cross_entropy_with_logits(logits, t, pos_weight=pos_w)
 
             loss.backward()
+            if args.clip is not None and args.clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             optimizer.step()
 
             total_loss += loss.item()
@@ -207,56 +227,74 @@ def main():
                 wandb.log({'train/loss': loss.item()}, step=train_step)
             train_step += 1
 
-            break
-
         batch_bar.close()
         avg_loss = total_loss / max(1, steps + 1)
 
         # Validation
         model.eval()
         y_true, y_pred = [], []
-        val_loss = 0.0
-        val_rmse = 0.0
-        steps = 0
+        val_loss_sum = 0.0
+        se_sum = 0.0
+        n_sum = 0
 
-        with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.inference_mode(), torch.cuda.amp.autocast(enabled=use_amp):
             for batch in tqdm(val_loader, desc="Val", leave=False, dynamic_ncols=True):
                 batch = batch.to(device, non_blocking=True)
-                y = batch[rel].edge_label.float()     # target stars
+                y = batch[rel].edge_label.float()
 
-                preds = model(batch).view(-1)
+                logits = model(batch)
+                t = ordinal_targets(y)
+                val_loss_sum += F.binary_cross_entropy_with_logits(logits, t, pos_weight=pos_w).item()
 
-                val_loss += criterion(preds, y).item()
-                val_rmse += torch.sqrt(F.mse_loss(preds, y)).item()
-                steps += 1
+                probs = torch.sigmoid(logits)
+                preds = 1 + (probs > 0.5).sum(dim=1)
+
+                se_sum += ((preds - y)**2).sum().item()
+                n_sum  += y.numel()
 
                 y_true.append(y)
                 y_pred.append(preds)
 
-        val_loss /= max(1, steps)
-        val_rmse /= max(1, steps)
+        val_loss = val_loss_sum / max(1, len(val_loader))
+        val_rmse = (se_sum / max(1, n_sum)) ** 0.5
 
         y_true = torch.cat(y_true).float()
         y_pred = torch.cat(y_pred).float()
 
-        # Ensure integers on CPU for metrics/logging
-        y_true_i = y_true.round().long().cpu()
-        y_pred_i = y_pred.clamp(1, 5).round().long().cpu()
+        # ensure integers on CPU for metrics/logging
+        y_true_i = y_true.clamp(1, 5).round().int().cpu()
+        y_pred_i = y_pred.clamp(1, 5).round().int().cpu()
+
+        val_acc = (y_true_i == y_pred_i).float().mean().item()
+
+        if run is not None:
+            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'val/loss': val_loss, 'val/rmse': val_rmse, 'val_acc': val_acc}, step=train_step)
 
         if val_rmse < best_val:
             best_val = val_rmse
             os.makedirs(os.path.dirname(args.model_dir), exist_ok=True)
             torch.save(model.state_dict(), args.model_dir)
 
-        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}'})
+        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}', 'val_acc': val_acc})
 
-        if run is not None:
-            cm_plot = wandb.plot.confusion_matrix(
-                preds=y_pred_i.tolist(),
-                y_true=y_true_i.tolist(),
-            )
+        print(y_true_i.tolist()[:20])
+        print(y_pred_i.tolist()[:20])
 
-            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'val/loss': val_loss, 'val/rmse': val_rmse, "val/confusion_matrix": cm_plot}, step=train_step)
+    if run is not None:
+            class_labels = ['1 star', '2 star', '3 star', '4 star', '5 star']
+            y_true_idx = torch.clamp(y_true_i - 1, 0, 4).tolist()
+            y_pred_idx = torch.clamp(y_pred_i - 1, 0, 4).tolist()
 
+            wandb.log({
+                        "my_conf_mat_id": wandb.plot.confusion_matrix(
+                            probs=None,
+                            preds=y_pred_idx,
+                            y_true=y_true_idx,
+                            class_names=class_labels
+                        )
+                    }, step=train_step)
+            
+            run.finish()
+            
 if __name__ == "__main__":
     main()

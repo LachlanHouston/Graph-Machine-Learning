@@ -8,24 +8,42 @@ from typing import Tuple
 
 class RelTemporalEncoding(nn.Module):
     """
-    Encode scalar(s) Δt with a small learnable cosine basis, as in pyHGT.
-    Input: y in R^{E, d_in} (here d_in=2: Δt_u, Δt_b)
-    Output: R^{E, d_out} with tiny dimension.
+    Cosine basis temporal encoding (learnable frequencies + phases).
+    Input:  y  [E, d_in]   (we'll use d_in=1 with years)
+    Output: [E, d_out]
     """
-    def __init__(self, d_in=2, n_freq=4, d_out=16):
+    def __init__(self, d_in: int = 1, n_freq: int = 8, d_out: int = 16, dropout: float = 0.0):
         super().__init__()
-        # One frequency vector per input channel
-        self.freq = nn.Parameter(torch.randn(d_in, n_freq))   # learnable "w"
-        self.phase= nn.Parameter(torch.zeros(d_in, n_freq))   # learnable "phi"
-        self.proj = nn.Linear(d_in * n_freq, d_out)
+        self.d_in = d_in
+        self.n_freq = n_freq
+        self.d_out = d_out
 
-    def forward(self, y):  # y: [E, d_in]
-        # expand: [E, d_in, 1] -> broadcast with [d_in, n_freq]
-        # result: [E, d_in, n_freq]
-        w = y.unsqueeze(-1) * self.freq + self.phase
-        c = torch.cos(w)                       # cosine basis
-        c = c.flatten(1)                       # [E, d_in*n_freq]
-        return self.proj(c)                    # [E, d_out]
+        # Learnable frequencies (positive) and phases
+        self.log_freq = nn.Parameter(torch.zeros(n_freq, d_in))   # exp -> (0, ∞)
+        self.phase    = nn.Parameter(torch.zeros(n_freq, d_in))
+
+        # Linear projection to d_out
+        self.proj = nn.Linear(n_freq * d_in, d_out)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, y: Tensor) -> Tensor:
+        """
+        y: [E, d_in] (float). Recommended to be roughly standardized.
+        """
+        # [E, d_in] -> [1, E, d_in] to broadcast over frequencies
+        y_exp = y.unsqueeze(0)                                     # [1, E, d_in]
+        freq  = torch.exp(self.log_freq).unsqueeze(1)              # [F, 1, d_in]
+        phase = self.phase.unsqueeze(1)                            # [F, 1, d_in]
+
+        # Cosine features: [F, E, d_in]
+        c = torch.cos(y_exp * freq + phase)
+
+        # Collapse to [E, F*d_in]
+        c = c.permute(1, 0, 2).reshape(y.shape[0], -1)
+
+        out = self.proj(c)                                         # [E, d_out]
+        out = self.dropout(torch.nn.functional.gelu(out))
+        return out
 
 class EdgeHGT(nn.Module):
     def __init__(self, metadata, hidden_dim=128, num_layers=2, heads=2, dropout=0.1,
@@ -54,7 +72,7 @@ class EdgeHGT(nn.Module):
             ) for _ in range(num_layers)
         ])
 
-        self.time_enc = RelTemporalEncoding(d_in=2, n_freq=4, d_out=time_out)
+        self.time_enc = RelTemporalEncoding(d_in=1, n_freq=8, d_out=time_out, dropout=dropout)
 
         self._global_num_nodes = {}
 
@@ -82,9 +100,12 @@ class EdgeHGT(nn.Module):
         edge_index_dict = {etype: batch[etype].edge_index for etype in batch.edge_types}
 
         for conv in self.hgt:
-            x_dict = conv(x_dict, edge_index_dict)
-            for ntype in x_dict:
-                x_dict[ntype] = self.dropout(self.norms[ntype](x_dict[ntype]))
+            x_in = {k: v for k, v in x_dict.items()}
+            x_pn = {k: self.norms[k](v) for k, v in x_dict.items()}
+            x_out = conv(x_pn, edge_index_dict)
+            for k in x_out:
+                x_out[k] = x_in[k] + self.dropout(x_out[k])
+            x_dict = x_out
 
         # Pair endpoints for labeled edges
         eidx: torch.Tensor = batch[rel].edge_label_index
@@ -94,9 +115,21 @@ class EdgeHGT(nn.Module):
         if self.use_pair_interactions:
             parts += [torch.abs(hu - hv), hu * hv]
 
-        # dt = batch[rel].edge_attr[:, :2].to(hu.dtype)     # [E,2] = (Δt_u, Δt_b)
-        # t_emb = self.time_enc(dt)                         # [E,time_out]
-        # parts.append(t_emb)
+        if hasattr(batch[rel], "edge_label_time"):
+            # shape: [E] or [E, 1] -> make it [E, 1] float
+            t = batch[rel].edge_label_time.view(-1, 1).to(hu.dtype)
+
+            # Standardize per-batch (keeps things numerically stable)
+            t_mu  = t.mean(dim=0, keepdim=True)
+            t_std = t.std(dim=0, keepdim=True).clamp_min(1e-6)
+            t_z   = (t - t_mu) / t_std
+
+            # Encode and append
+            t_emb = self.time_enc(t_z)
+            parts.append(t_emb)
+        else:
+            # If a batch ever arrives without timestamps, just skip.
+            pass
 
         return torch.cat(parts, dim=-1)
     
