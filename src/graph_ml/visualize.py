@@ -46,6 +46,12 @@ def visualize_link_batch(
     node_id_maps = {}
     deg = defaultdict(int)
 
+    def _hide_et(et):
+        # et is a 3-tuple: (src_type, rel_name, dst_type)
+        return str(et[1]).startswith("rev_")
+
+    visible_edge_types = [et for et in batch.edge_types if not _hide_et(et)]
+
     total_nodes = sum(int(getattr(batch[nt], "num_nodes", 0)) for nt in batch.node_types)
     take_ratio = 1.0 if total_nodes <= max_nodes else max_nodes / float(total_nodes)
 
@@ -63,10 +69,10 @@ def visualize_link_batch(
 
     # add edges
     # keep a per-relation list aligning edges to the source .time tensor indices
-    rel_edges = {et: [] for et in batch.edge_types}
-    for et in batch.edge_types:
+    rel_edges = {et: [] for et in visible_edge_types}
+    for et in visible_edge_types:  # << change from batch.edge_types
         ei = batch[et].edge_index
-        if ei.numel() == 0: 
+        if ei.numel() == 0:
             continue
         src_type, _, dst_type = et
         allowed_src = node_id_maps.get(src_type, {})
@@ -75,10 +81,10 @@ def visualize_link_batch(
         for idx, (s, d) in enumerate(zip(s_list, d_list)):
             if s in allowed_src and d in allowed_dst:
                 u = (src_type, s); v = (dst_type, d)
-                G.add_edge(u, v, etype=et, eidx=idx)  # store original edge idx
+                G.add_edge(u, v, etype=et, eidx=idx)
                 rel_edges[et].append(((u, v), idx))
                 deg[u] += 1; deg[v] += 1
-
+                
     # node sizes
     sizes = [max(60.0, math.sqrt(max(1, deg[n])) * node_size_scale) for n in G.nodes]
 
@@ -107,9 +113,9 @@ def visualize_link_batch(
         )
 
     # edges (per relation)
-    for et in batch.edge_types:
+    for et in visible_edge_types:
         edges = [(u, v) for (u, v, d) in G.edges(data=True) if d.get("etype") == et]
-        if not edges: 
+        if not edges:
             continue
         nx.draw_networkx_edges(
             G, pos, edgelist=edges,
@@ -119,8 +125,9 @@ def visualize_link_batch(
             arrows=False,
         )
 
+    # optional sampling annotations
     if annotate_sample_k and annotate_sample_k > 0:
-        for et in batch.edge_types:
+        for et in visible_edge_types:
             if not hasattr(batch[et], "time") or batch[et].time is None:
                 continue
             times = batch[et].time
@@ -193,7 +200,7 @@ def visualize_link_batch(
     edge_handles = [
         Line2D([0], [0], color=edge_palette.get(et, "#999999"),
                linestyle=edge_styles.get(et, "solid"), linewidth=2, label=str(et))
-        for et in batch.edge_types
+        for et in visible_edge_types
         if any(d.get("etype")==et for *_, d in G.edges(data=True))
     ]
     handles = node_handles + edge_handles + [Line2D([0],[0], color=highlight_color, linewidth=3, label="target edges")]
@@ -216,21 +223,23 @@ if __name__ == "__main__":
     rel = ("user", "reviews", "business")
 
     data = load_yelp_as_hetero('data/raw/', max_reviews=250_000, 
-                               min_review_len=5, seed=52, 
+                               min_review_len=0, seed=42, 
                                cache=True, cache_subdir="processed", 
                                include_user_friends=True, max_friends_per_user=50)
+    
+    print(data.metadata())
     
     num_classes = 1
     
     train_idx, val_idx = split_edge_indices_by_year(
-        data, rel=rel, boundary_year=2017, include_boundary_in_train=False
+        data, rel=rel, boundary_year=2017, include_boundary_in_train=True
     )
 
 
     num_neighbors = {
-        ("user","reviews","business"): [8,8],
-        ("business","rev_reviews","user"): [16,16],
-        ("user","friends","user"): [4,4],   # much smaller
+        ("user","reviews","business"): [25,25],
+        ("business","rev_reviews","user"): [15,15],
+        ("user","friends","user"): [10,10],
     }
 
     stars = data[rel].edge_label           # [E]
@@ -242,7 +251,7 @@ if __name__ == "__main__":
     common_kwargs = dict(
         data=data,
         num_neighbors=num_neighbors,
-        batch_size=64,
+        batch_size=4,
         shuffle=True,
         num_workers=0,
         pin_memory=False,
@@ -255,7 +264,8 @@ if __name__ == "__main__":
         edge_label_index=(rel, data[rel].edge_index[:, train_idx]),
         edge_label= train_label,
         edge_label_time=years[train_idx],
-        time_attr="time"
+        time_attr="time",
+        subgraph_type='directional',
     )
 
     val_loader = LinkNeighborLoader(
@@ -271,7 +281,7 @@ if __name__ == "__main__":
             batch.cpu(), 
             highlight_rel=("user","reviews","business"),
             annotate_targets=True,     # show years on target edges
-            annotate_sample_k=10,      # plus 10 random edges per relation
+            annotate_sample_k=20,      # plus 10 random edges per relation
             year_fmt=lambda y: str(int(y)),
             save_path="reports/figures/yelp_train_batch.png"
         )
@@ -282,7 +292,7 @@ if __name__ == "__main__":
             batch.cpu(), 
             highlight_rel=("user","reviews","business"),
             annotate_targets=True,     # show years on target edges
-            annotate_sample_k=10,      # plus 10 random edges per relation
+            annotate_sample_k=20,      # plus 10 random edges per relation
             year_fmt=lambda y: str(int(y)),
             save_path="reports/figures/yelp_val_batch.png"
         )
