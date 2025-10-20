@@ -222,5 +222,6 @@ notebooks/
 src/graph_ml/tempCodeRunnerFile.py
 
 # Hydra
+conf/
 configs/
 outputs/

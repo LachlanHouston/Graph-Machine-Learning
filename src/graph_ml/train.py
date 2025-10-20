@@ -29,7 +29,7 @@ def ordinal_targets(y):
     k = torch.arange(1, 5, device=y.device).unsqueeze(0).expand(B, -1)
     return (y.unsqueeze(1) > k).float()
 
-@hydra.main(version_base="1.3", config_path="../../conf", config_name="config")
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="config")
 def main(cfg: DictConfig):
     # Pretty-print the composed config
     print(OmegaConf.to_yaml(cfg, resolve=True))
