@@ -1,0 +1,8 @@
+# conf/data.yaml
+data:
+  data_dir: data/raw/
+  max_reviews: 250000
+  min_review_len: 0
+  use_text_edge_attr: false
+  cuda: 0
+  seed: 42

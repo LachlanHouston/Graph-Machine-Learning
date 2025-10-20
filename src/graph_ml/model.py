@@ -54,7 +54,6 @@ class HGTStarPredictor(nn.Module):
                 out_channels=hidden_dim,
                 metadata=metadata,
                 heads=num_heads,
-                root_weight=True,
             )
             for _ in range(num_layers)
         ])

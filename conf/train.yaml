@@ -1,0 +1,10 @@
+# conf/train.yaml
+train:
+  batch_size: 4
+  n_epoch: 10
+  n_batch: 500
+  clip: 1.0
+  lr: 0.0002
+  weight_decay: 0.0002
+  # Save path: tie to Hydra output dir so each run is isolated
+  model_path: ${hydra:runtime.output_dir}/model.pt

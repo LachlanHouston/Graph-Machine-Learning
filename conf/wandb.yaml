@@ -1,0 +1,6 @@
+# conf/wandb.yaml
+wandb:
+  enabled: false
+  project: "Graph Machine Learning"
+  run_name: null
+  mode: null   # null | online | offline

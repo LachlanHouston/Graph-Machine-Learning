@@ -2,6 +2,10 @@ import os
 import argparse
 import time
 
+from omegaconf import DictConfig, OmegaConf
+import hydra
+from hydra.utils import to_absolute_path
+
 import torch
 import torch.nn.functional as F
 from warnings import filterwarnings
@@ -25,50 +29,32 @@ def ordinal_targets(y):
     k = torch.arange(1, 5, device=y.device).unsqueeze(0).expand(B, -1)
     return (y.unsqueeze(1) > k).float()
 
-def main():
-    parser = argparse.ArgumentParser(description='Training GNN')
-    parser.add_argument('--data_dir', type=str, default='data/raw/')
-    parser.add_argument('--model_dir', type=str, default=f'models/run_{int(time.time())}.pt')
-    parser.add_argument('--cuda', type=int, default=0)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument("--max_reviews", type=int, default=250_000)
-    parser.add_argument("--min_review_len", type=int, default=0)
-    parser.add_argument("--use_text_edge_attr", action="store_true", default=False)
-    parser.add_argument("--svd_dim", type=int, default=64)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument('--n_hid', type=int, default=512)
-    parser.add_argument('--n_heads', type=int, default=4)
-    parser.add_argument('--n_layers', type=int, default=4)
-    parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--n_epoch', type=int, default=10)
-    parser.add_argument('--n_batch', type=int, default=500)
-    parser.add_argument('--clip', type=float, default=1.0)
-    parser.add_argument('--lr', type=float, default=2e-4)
-    parser.add_argument('--weight_decay', type=float, default=2e-4)
-    parser.add_argument('--wandb', action='store_true')
-    parser.add_argument('--wandb_project', type=str, default='Graph Machine Learning')
-    parser.add_argument('--wandb_run_name', type=str, default=None)
-    parser.add_argument('--wandb_mode', type=str, default=None, choices=[None, 'online', 'offline'])
-    args = parser.parse_args()
+@hydra.main(version_base="1.3", config_path="../../conf", config_name="config")
+def main(cfg: DictConfig):
+    # Pretty-print the composed config
+    print(OmegaConf.to_yaml(cfg, resolve=True))
 
-    args_print(args)
-    set_seed(args.seed)
+    # Reproduce old printing/seed behavior
+    set_seed(cfg.data.seed)
 
-    device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
+    # Resolve any file system paths that should be relative to original CWD
+    data_dir = to_absolute_path(cfg.data.data_dir)
+
+    device = torch.device(f"cuda:{cfg.data.cuda}" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
     rel = ("user", "reviews", "business")
 
     data = load_yelp_as_hetero(
-        args.data_dir,
-        max_reviews=args.max_reviews,
-        min_review_len=args.min_review_len,
-        seed=args.seed,
+        data_dir=data_dir,
+        max_reviews=cfg.data.max_reviews,
+        min_review_len=cfg.data.min_review_len,
+        seed=cfg.data.seed,
         cache=True,
         cache_subdir="processed",
         include_user_friends=True,
         max_friends_per_user=50,
-        use_text_edge_attr=True,
+        use_text_edge_attr=cfg.data.use_text_edge_attr,
     )
 
     print(data.metadata())
@@ -94,7 +80,7 @@ def main():
     common_kwargs = dict(
         data=data,
         num_neighbors=num_neighbors,
-        batch_size=args.batch_size,
+        batch_size=cfg.train.batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
@@ -130,10 +116,10 @@ def main():
         metadata=data.metadata(),
         num_nodes=num_nodes,
         in_dims=in_dims,
-        hidden_dim=args.n_hid,
-        num_layers=args.n_layers,
-        num_heads=args.n_heads,
-        dropout=args.dropout,
+        hidden_dim=cfg.model.n_hid,
+        num_layers=cfg.model.n_layers,
+        num_heads=cfg.model.n_heads,
+        dropout=cfg.model.dropout,
         edge_attr_dim=edge_attr_dim,
         out_mode="ordinal",
     ).to(device)
@@ -144,25 +130,25 @@ def main():
     optimizer = torch.optim.AdamW(
         [
             {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-             'weight_decay': args.weight_decay},
+             'weight_decay': cfg.train.weight_decay},
             {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
              'weight_decay': 0.0}
         ],
-        lr=args.lr,
+        lr=cfg.train.lr,
         eps=1e-8
     )
 
     run = None
-    if args.wandb:
+    if cfg.wandb.enabled:
         if wandb is None:
-            print("wandb not installed; run `pip install wandb` or disable --wandb")
+            print("wandb not installed; set wandb.enabled=false or pip install wandb")
         else:
-            mode = args.wandb_mode or os.environ.get('WANDB_MODE') or 'online'
+            mode = cfg.wandb.mode or os.environ.get('WANDB_MODE') or 'online'
             run = wandb.init(
-                project=args.wandb_project,
-                name=args.wandb_run_name,
+                project=cfg.wandb.project,
+                name=cfg.wandb.run_name,
                 mode=mode,
-                config=vars(args),
+                config=OmegaConf.to_container(cfg, resolve=True),
             )
             wandb.watch(model, log="gradients")
 
@@ -174,14 +160,14 @@ def main():
     best_val = float("inf")
     train_step = 0
 
-    epoch_bar = tqdm(range(1, args.n_epoch + 1), desc="Epochs", leave=True)
+    epoch_bar = tqdm(range(1, cfg.train.n_epoch + 1), desc="Epochs", leave=True)
     for epoch in epoch_bar:
         model.train()
         total_loss = 0.0
         steps = 0
 
-        batch_bar = tqdm(total=args.n_batch, desc="Train batches", leave=False)
-        for steps, batch in zip(range(args.n_batch), train_loader):
+        batch_bar = tqdm(total=cfg.train.n_batch, desc="Train batches", leave=False)
+        for steps, batch in zip(range(cfg.train.n_batch), train_loader):
             batch = batch.to(device)
             y_train = batch[rel].edge_label.float()
             optimizer.zero_grad(set_to_none=True)
@@ -198,8 +184,8 @@ def main():
                 loss = F.binary_cross_entropy_with_logits(out, t, pos_weight=pos_w)
 
             loss.backward()
-            if args.clip and args.clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+            if cfg.train.clip and cfg.train.clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.clip)
             optimizer.step()
 
             total_loss += loss.item()
@@ -252,8 +238,8 @@ def main():
 
         if val_rmse < best_val:
             best_val = val_rmse
-            os.makedirs(os.path.dirname(args.model_dir), exist_ok=True)
-            torch.save(model.state_dict(), args.model_dir)
+            os.makedirs(os.path.dirname(cfg.train.model_path), exist_ok=True)
+            torch.save(model.state_dict(), cfg.train.model_path)
 
         epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}', 'val_acc': val_acc})
         print(y_true_i.tolist()[:20])
