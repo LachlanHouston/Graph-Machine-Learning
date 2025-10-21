@@ -9,9 +9,10 @@ from warnings import filterwarnings
 from tqdm import tqdm
 from torch_geometric.loader import LinkNeighborLoader
 
+
 from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year
 from graph_ml.model import HGTStarPredictor
-from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits
+from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits, log_confmatrix
 
 try:
     import wandb
@@ -233,6 +234,9 @@ def main(cfg: DictConfig):
         y_pred_i = y_pred.clamp(1, 5).round().int().cpu()
         val_acc = (y_true_i == y_pred_i).float().mean().item()
 
+        if run is not None and (epoch % cfg.wandb.conf_matrix == 0):
+            log_confmatrix(run, y_true_i, y_pred_i, step=train_step, normalize=None, title="Val Confusion Matrix")
+
         val_logits = torch.cat(val_logits_list, dim=0)
         val_targets = torch.cat(val_targets_list, dim=0)
         f1_micro = multilabel_f1_from_logits(
@@ -253,29 +257,18 @@ def main(cfg: DictConfig):
                        'val/f1_micro': f1_micro, 'val/f1_macro': f1_macro}, step=train_step)
 
         if val_rmse < best_val:
-            print(f'Saving new best model with val_acc: {val_acc} and val_rmse: {val_rmse:.4f}')
+            print(f'Saving new best model with val_acc: {val_acc:.4f} and val_rmse: {val_rmse:.4f}')
             best_val = val_rmse
             os.makedirs(os.path.dirname(cfg.train.model_path), exist_ok=True)
             torch.save(model.state_dict(), cfg.train.model_path)
 
-        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}', 'val_acc': val_acc,
+        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}', 'val_acc': f'{val_acc:.4f}',
                                'f1_micro': f'{f1_micro:.4f}', 'f1_macro': f'{f1_macro:.4f}'})
         
         print(y_true_i.tolist()[:20])
         print(y_pred_i.tolist()[:20])
 
     if run is not None:
-        class_labels = ['1 star', '2 star', '3 star', '4 star', '5 star']
-        y_true_idx = torch.clamp(y_true_i - 1, 0, 4).tolist()
-        y_pred_idx = torch.clamp(y_pred_i - 1, 0, 4).tolist()
-        wandb.log({
-            "my_conf_mat_id": wandb.plot.confusion_matrix(
-                probs=None,
-                preds=y_pred_idx,
-                y_true=y_true_idx,
-                class_names=class_labels
-            )
-        }, step=train_step)
         run.finish()
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import numpy as np
 import random
 import torch
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from texttable import Texttable
 
 def get_n_params(model):
@@ -82,3 +84,34 @@ def multilabel_f1_from_logits(logits, targets, threshold=0.5, average="micro", e
         return f1_c.mean().item()
     else:
         raise ValueError("average must be 'micro' or 'macro'")
+    
+def log_confmatrix(run, y_true_i, y_pred_i, step, normalize=None, title="Val Confusion Matrix"):
+    """
+    y_true_i, y_pred_i: int tensors in {1..5}
+    normalize: None | 'true' | 'pred' | 'all' (sklearn options)
+    Logs a Matplotlib confusion matrix figure to Weights & Biases.
+    """
+    if run is None:
+        return
+
+    class_labels = ['1 star', '2 star', '3 star', '4 star', '5 star']
+    # keep labels explicit to pin row/col order
+    labels = [1, 2, 3, 4, 5]
+
+    cm = confusion_matrix(
+        y_true=y_true_i.cpu().numpy(),
+        y_pred=y_pred_i.cpu().numpy(),
+        labels=labels,
+        normalize=normalize,
+    )
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_labels)
+    # values_format depends on normalization
+    values_format = '.2f' if normalize else 'd'
+    disp.plot(ax=ax, cmap='Blues', colorbar=False, values_format=values_format)
+    ax.set_title(title + (f" (normalize={normalize})" if normalize else ""))
+    fig.tight_layout()
+
+    run.log({"val/confusion_matrix": wandb.Image(fig)}, step=step)
+    plt.close(fig)
