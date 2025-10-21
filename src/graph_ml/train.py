@@ -11,7 +11,7 @@ from torch_geometric.loader import LinkNeighborLoader
 
 from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year
 from graph_ml.model import HGTStarPredictor
-from graph_ml.utils import get_n_params, set_seed
+from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits
 
 try:
     import wandb
@@ -65,14 +65,13 @@ def main(cfg: DictConfig):
         data, rel=rel, boundary_year=2017, include_boundary_in_train=True
     )
 
-    num_neighbors = {
-        ("user","reviews","business"):   [20, 15, 10, 5],
-        ("business","rev_reviews","user"): [6, 3, 0, 0],
-        ("user","friends","user"):       [6, 4, 2, 0],
-    }
+    num_neighbors = build_num_neighbors_from_cfg(cfg)
 
     num_workers = max(1, os.cpu_count() - 1) if device.type == "cuda" else 0
+    print(f"Using num_workers={num_workers} for data loading")
+
     prefetch_factor = 2 if device.type == "cuda" else None
+
     common_kwargs = dict(
         data=data,
         num_neighbors=num_neighbors,
@@ -193,7 +192,10 @@ def main(cfg: DictConfig):
         avg_loss = total_loss / max(1, steps + 1)
 
         model.eval()
-        y_true, y_pred = [], []
+        y_true_stars = [] 
+        y_pred_stars = []
+        val_logits_list = []
+        val_targets_list = []
         val_loss_sum = 0.0
         se_sum = 0.0
         n_sum = 0
@@ -208,32 +210,57 @@ def main(cfg: DictConfig):
                     label_edge_type=rel,
                     batch=batch,
                 )
+
                 t = ordinal_targets(y)
                 val_loss_sum += F.binary_cross_entropy_with_logits(out, t, pos_weight=pos_w).item()
+
                 probs = torch.sigmoid(out)
                 preds = 1 + (probs > 0.5).sum(dim=1)
                 se_sum += ((preds - y)**2).sum().item()
                 n_sum += y.numel()
-                y_true.append(y)
-                y_pred.append(preds)
+                y_true_stars.append(y)
+                y_pred_stars.append(preds)
+
+                val_logits_list.append(out.detach().cpu())
+                val_targets_list.append(t.detach().cpu())
 
         val_loss = val_loss_sum / max(1, len(val_loader))
         val_rmse = (se_sum / max(1, n_sum)) ** 0.5
-        y_true = torch.cat(y_true).float()
-        y_pred = torch.cat(y_pred).float()
+
+        y_true = torch.cat(y_true_stars).float()
+        y_pred = torch.cat(y_pred_stars).float()
         y_true_i = y_true.clamp(1, 5).round().int().cpu()
         y_pred_i = y_pred.clamp(1, 5).round().int().cpu()
         val_acc = (y_true_i == y_pred_i).float().mean().item()
 
+        val_logits = torch.cat(val_logits_list, dim=0)
+        val_targets = torch.cat(val_targets_list, dim=0)
+        f1_micro = multilabel_f1_from_logits(
+            logits=val_logits,
+            targets=val_targets,
+            threshold=0.5,
+            average="micro",
+        )
+        f1_macro = multilabel_f1_from_logits(
+            logits=val_logits,
+            targets=val_targets,
+            threshold=0.5,
+            average="macro",
+        )
+
         if run is not None:
-            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'val/loss': val_loss, 'val/rmse': val_rmse, 'val_acc': val_acc}, step=train_step)
+            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'val/loss': val_loss, 'val/rmse': val_rmse, 'val_acc': val_acc,
+                       'val/f1_micro': f1_micro, 'val/f1_macro': f1_macro}, step=train_step)
 
         if val_rmse < best_val:
+            print(f'Saving new best model with val_acc: {val_acc} and val_rmse: {val_rmse:.4f}')
             best_val = val_rmse
             os.makedirs(os.path.dirname(cfg.train.model_path), exist_ok=True)
             torch.save(model.state_dict(), cfg.train.model_path)
 
-        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}', 'val_acc': val_acc})
+        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}', 'val_acc': val_acc,
+                               'f1_micro': f'{f1_micro:.4f}', 'f1_macro': f'{f1_macro:.4f}'})
+        
         print(y_true_i.tolist()[:20])
         print(y_pred_i.tolist()[:20])
 
