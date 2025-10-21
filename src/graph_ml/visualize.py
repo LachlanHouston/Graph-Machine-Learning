@@ -20,6 +20,7 @@ def visualize_link_batch(
 ):
     """
     Draw the hetero subgraph with clear type styling + optional edge-year labels.
+    Ensures target edge endpoints are always included in the visualization even when pruning.
     """
     # -------- palettes & styles --------
     node_palette = {
@@ -55,22 +56,46 @@ def visualize_link_batch(
     total_nodes = sum(int(getattr(batch[nt], "num_nodes", 0)) for nt in batch.node_types)
     take_ratio = 1.0 if total_nodes <= max_nodes else max_nodes / float(total_nodes)
 
+    # ---- must-keep: endpoints of target edges (so targets always render) ----
+    must_keep = {nt: set() for nt in batch.node_types}
+    if highlight_rel in batch.edge_types and hasattr(batch[highlight_rel], "edge_label_index"):
+        el = batch[highlight_rel].edge_label_index  # [2, M]
+        s_type, _, d_type = highlight_rel
+        if el is not None and el.numel() > 0:
+            for s in el[0].tolist():
+                must_keep[s_type].add(int(s))
+            for d in el[1].tolist():
+                must_keep[d_type].add(int(d))
+
+    # ---- add nodes (ensure must-keep are included even under pruning) ----
     for ntype in batch.node_types:
         num = int(getattr(batch[ntype], "num_nodes", 0))
-        if num == 0: 
+        if num == 0:
             continue
-        ids = torch.arange(num)
+        all_ids = torch.arange(num)
+        keep_ids = set(must_keep.get(ntype, set()))
+
         if take_ratio < 1.0:
-            k = max(1, int(math.ceil(num * take_ratio)))
-            ids = ids[torch.randperm(num)[:k]]
+            k = max(len(keep_ids), int(math.ceil(num * take_ratio)))
+            remaining = [i for i in all_ids.tolist() if i not in keep_ids]
+            need = k - len(keep_ids)
+            if need > 0 and remaining:
+                add = torch.tensor(remaining)[torch.randperm(len(remaining))[:need]].tolist()
+            else:
+                add = []
+            chosen = list(keep_ids) + add
+            ids = torch.tensor(sorted(set(chosen)), dtype=torch.long)
+        else:
+            ids = all_ids
+
         node_id_maps[ntype] = {int(i): f"{ntype[:3]}:{int(i)}" for i in ids.tolist()}
         for i in ids.tolist():
-            G.add_node((ntype, i), ntype=ntype)
+            G.add_node((ntype, int(i)), ntype=ntype)
 
-    # add edges
+    # ---- add edges ----
     # keep a per-relation list aligning edges to the source .time tensor indices
     rel_edges = {et: [] for et in visible_edge_types}
-    for et in visible_edge_types:  # << change from batch.edge_types
+    for et in visible_edge_types:
         ei = batch[et].edge_index
         if ei.numel() == 0:
             continue
@@ -84,20 +109,18 @@ def visualize_link_batch(
                 G.add_edge(u, v, etype=et, eidx=idx)
                 rel_edges[et].append(((u, v), idx))
                 deg[u] += 1; deg[v] += 1
-                
-    # node sizes
-    sizes = [max(60.0, math.sqrt(max(1, deg[n])) * node_size_scale) for n in G.nodes]
 
-    # layout
+    # ---- node sizes & layout ----
+    sizes = [max(60.0, math.sqrt(max(1, deg[n])) * node_size_scale) for n in G.nodes]
     k = None if len(G) < 200 else 1 / math.sqrt(len(G))
     pos = nx.spring_layout(G, seed=seed, k=k)
 
     plt.figure(figsize=figsize)
 
-    # nodes (distinct by type)
+    # ---- draw nodes per type ----
     for ntype in batch.node_types:
         nodelist = [n for n in G.nodes if n[0] == ntype]
-        if not nodelist: 
+        if not nodelist:
             continue
         idxs = [list(G.nodes).index(n) for n in nodelist]
         nsizes = [sizes[i] for i in idxs]
@@ -112,7 +135,7 @@ def visualize_link_batch(
             edgecolors="#ffffff",
         )
 
-    # edges (per relation)
+    # ---- draw edges per relation ----
     for et in visible_edge_types:
         edges = [(u, v) for (u, v, d) in G.edges(data=True) if d.get("etype") == et]
         if not edges:
@@ -125,7 +148,7 @@ def visualize_link_batch(
             arrows=False,
         )
 
-    # optional sampling annotations
+    # ---- optional sampling annotations (random edges per relation) ----
     if annotate_sample_k and annotate_sample_k > 0:
         for et in visible_edge_types:
             if not hasattr(batch[et], "time") or batch[et].time is None:
@@ -136,8 +159,8 @@ def visualize_link_batch(
             pairs = rel_edges.get(et, [])
             if not pairs:
                 continue
-            k = min(annotate_sample_k, len(pairs))
-            perm = torch.randperm(len(pairs))[:k].tolist()
+            k_samp = min(annotate_sample_k, len(pairs))
+            perm = torch.randperm(len(pairs))[:k_samp].tolist()
             for j in perm:
                 (u, v), eidx = pairs[j]
                 t = times[eidx].item()
@@ -150,6 +173,7 @@ def visualize_link_batch(
                     color=edge_palette.get(et, "#333333"),
                 )
 
+    # ---- highlighted target edges (always drawn now because endpoints are forced in) ----
     if highlight_rel in batch.edge_types and hasattr(batch[highlight_rel], "edge_label_index"):
         el = batch[highlight_rel].edge_label_index  # [2, M]
         if el is not None and el.numel() > 0:
@@ -158,37 +182,36 @@ def visualize_link_batch(
             allowed_dst = node_id_maps.get(dst_type, {})
             hl_edges = []
             for s, d in zip(el[0].tolist(), el[1].tolist()):
-                if s in allowed_src and d in allowed_dst:
+                if (s in allowed_src) and (d in allowed_dst):
                     hl_edges.append(((src_type, s), (dst_type, d)))
 
             if hl_edges:
-                # draw highlighted edges (thicker/red)
                 nx.draw_networkx_edges(
-                    G, pos, edgelist=hl_edges, width=3.2, alpha=0.95,
-                    edge_color="#d62728", arrows=False
+                    G, pos, edgelist=hl_edges, width=highlight_width, alpha=0.95,
+                    edge_color=highlight_color, arrows=False
                 )
 
-                # ALWAYS annotate: use edge_label_time if available
-                tvec = getattr(batch[highlight_rel], "edge_label_time", None)
-                if tvec is not None:
-                    tvec = tvec.view(-1) if tvec.dim() > 1 else tvec
-                    L = min(len(hl_edges), tvec.numel())
-                    for ((u, v), t) in zip(hl_edges[:L], tvec[:L].tolist()):
-                        mid = (pos[u] + pos[v]) / 2.0
-                        plt.text(
-                            mid[0], mid[1], year_fmt(t),
-                            fontsize=9, fontweight="bold",
-                            ha="center", va="center",
-                            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=0.5),
-                            color="#d62728",
-                        )
+                if annotate_targets:
+                    tvec = getattr(batch[highlight_rel], "edge_label_time", None)
+                    if tvec is not None:
+                        tvec = tvec.view(-1) if tvec.dim() > 1 else tvec
+                        L = min(len(hl_edges), tvec.numel())
+                        for ((u, v), t) in zip(hl_edges[:L], tvec[:L].tolist()):
+                            mid = (pos[u] + pos[v]) / 2.0
+                            plt.text(
+                                mid[0], mid[1], year_fmt(t),
+                                fontsize=9, fontweight="bold",
+                                ha="center", va="center",
+                                bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=0.5),
+                                color=highlight_color,
+                            )
 
-    # labels (optional)
+    # ---- labels (optional) ----
     if with_labels and len(G) <= 200:
         labels = {n: f"{n[0][:3]}:{n[1]}" for n in G.nodes}
         nx.draw_networkx_labels(G, pos, labels=labels, font_size=8, alpha=0.9)
 
-    # legend
+    # ---- legend ----
     node_handles = [
         Line2D([0], [0], marker=marker, color="none",
                markerfacecolor=node_palette.get(nt, "#7f7f7f"),
@@ -222,36 +245,36 @@ if __name__ == "__main__":
 
     rel = ("user", "reviews", "business")
 
-    data = load_yelp_as_hetero('data/raw/', max_reviews=250_000, 
-                               min_review_len=0, seed=42, 
-                               cache=True, cache_subdir="processed", 
+    data = load_yelp_as_hetero('data/raw/',
+                               max_reviews=250_000,
+                               min_review_len=0, seed=42,
+                               cache=True, cache_subdir="processed",
                                include_user_friends=True, max_friends_per_user=50)
-    
+
     print(data.metadata())
-    
-    num_classes = 1
-    
+
     train_idx, val_idx = split_edge_indices_by_year(
         data, rel=rel, boundary_year=2017, include_boundary_in_train=True
     )
 
-
     num_neighbors = {
-        ("user","reviews","business"): [25,25],
-        ("business","rev_reviews","user"): [15,15],
-        ("user","friends","user"): [10,10],
+        ("user","reviews","business"):   [20, 15, 10, 5],
+        ("business","rev_reviews","user"): [6, 3, 0, 0],
+        ("user","friends","user"):       [6, 4, 2, 0],
     }
 
-    stars = data[rel].edge_label           # [E]
+    stars = data[rel].edge_label
     years = data[rel].time.squeeze()
 
-    train_label = stars[train_idx] # [Ntr, 2]
+    train_label = stars[train_idx]
     val_label   = stars[val_idx]
+
+    batch_size = 2
 
     common_kwargs = dict(
         data=data,
         num_neighbors=num_neighbors,
-        batch_size=4,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=0,
         pin_memory=False,
@@ -262,10 +285,9 @@ if __name__ == "__main__":
     train_loader = LinkNeighborLoader(
         **common_kwargs,
         edge_label_index=(rel, data[rel].edge_index[:, train_idx]),
-        edge_label= train_label,
+        edge_label=train_label,
         edge_label_time=years[train_idx],
         time_attr="time",
-        subgraph_type='directional',
     )
 
     val_loader = LinkNeighborLoader(
@@ -278,22 +300,22 @@ if __name__ == "__main__":
 
     for batch in train_loader:
         visualize_link_batch(
-            batch.cpu(), 
+            batch.cpu(),
             highlight_rel=("user","reviews","business"),
-            annotate_targets=True,     # show years on target edges
-            annotate_sample_k=20,      # plus 10 random edges per relation
+            annotate_targets=True,
+            annotate_sample_k=20,
             year_fmt=lambda y: str(int(y)),
-            save_path="reports/figures/yelp_train_batch.png"
+            save_path=f"reports/figures/yelp_train_batch_size_{batch_size}.png"
         )
         break
 
     for batch in val_loader:
         visualize_link_batch(
-            batch.cpu(), 
+            batch.cpu(),
             highlight_rel=("user","reviews","business"),
-            annotate_targets=True,     # show years on target edges
-            annotate_sample_k=20,      # plus 10 random edges per relation
+            annotate_targets=True,
+            annotate_sample_k=20,
             year_fmt=lambda y: str(int(y)),
-            save_path="reports/figures/yelp_val_batch.png"
+            save_path=f"reports/figures/yelp_val_batch_size_{batch_size}.png"
         )
         break

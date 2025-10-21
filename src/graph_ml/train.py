@@ -1,7 +1,4 @@
 import os
-import argparse
-import time
-
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from hydra.utils import to_absolute_path
@@ -14,7 +11,7 @@ from torch_geometric.loader import LinkNeighborLoader
 
 from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year
 from graph_ml.model import HGTStarPredictor
-from graph_ml.utils import args_print, get_n_params, set_seed
+from graph_ml.utils import get_n_params, set_seed
 
 try:
     import wandb
@@ -34,7 +31,6 @@ def main(cfg: DictConfig):
     # Pretty-print the composed config
     print(OmegaConf.to_yaml(cfg, resolve=True))
 
-    # Reproduce old printing/seed behavior
     set_seed(cfg.data.seed)
 
     # Resolve any file system paths that should be relative to original CWD
@@ -70,9 +66,9 @@ def main(cfg: DictConfig):
     )
 
     num_neighbors = {
-        ("user", "reviews", "business"): [25, 25],
-        ("business", "rev_reviews", "user"): [15, 15],
-        ("user", "friends", "user"): [10, 10],
+        ("user","reviews","business"):   [20, 15, 10, 5],
+        ("business","rev_reviews","user"): [6, 3, 0, 0],
+        ("user","friends","user"):       [6, 4, 2, 0],
     }
 
     num_workers = max(1, os.cpu_count() - 1) if device.type == "cuda" else 0
@@ -109,13 +105,11 @@ def main(cfg: DictConfig):
         time_attr="time",
     )
 
-    in_dims = {nt: data[nt].x.size(-1) for nt in data.node_types}
     edge_attr_dim = int(data[rel].edge_attr.size(-1)) if hasattr(data[rel], "edge_attr") else None
 
     model = HGTStarPredictor(
         metadata=data.metadata(),
         num_nodes=num_nodes,
-        in_dims=in_dims,
         hidden_dim=cfg.model.n_hid,
         num_layers=cfg.model.n_layers,
         num_heads=cfg.model.n_heads,
@@ -174,10 +168,9 @@ def main(cfg: DictConfig):
 
             with torch.cuda.amp.autocast(enabled=use_amp):
                 out = model(
-                    batch.x_dict,
                     batch.edge_index_dict,
                     edge_label_index=batch[rel].edge_label_index,
-                    edge_type=rel,
+                    label_edge_type=rel,
                     batch=batch,
                 )
                 t = ordinal_targets(y_train)
@@ -210,10 +203,9 @@ def main(cfg: DictConfig):
                 batch = batch.to(device, non_blocking=True)
                 y = batch[rel].edge_label.float()
                 out = model(
-                    batch.x_dict,
                     batch.edge_index_dict,
                     edge_label_index=batch[rel].edge_label_index,
-                    edge_type=rel,
+                    label_edge_type=rel,
                     batch=batch,
                 )
                 t = ordinal_targets(y)

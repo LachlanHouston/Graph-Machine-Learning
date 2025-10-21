@@ -8,26 +8,63 @@ import torch.nn as nn
 from torch import Tensor
 from torch_geometric.nn import HGTConv
 
+REL = ('user', 'reviews', 'business')
+
+class RelTemporalEncoding(nn.Module):
+    """
+    Cosine basis temporal encoding (learnable frequencies + phases).
+    Input:  y  [E, d_in]   (we'll use d_in=1 with years)
+    Output: [E, d_out]
+    """
+    def __init__(self, d_in: int = 1, n_freq: int = 8, d_out: int = 16, dropout: float = 0.0):
+        super().__init__()
+        self.d_in = d_in
+        self.n_freq = n_freq
+        self.d_out = d_out
+
+        # Learnable frequencies (positive) and phases
+        self.log_freq = nn.Parameter(torch.zeros(n_freq, d_in))   # exp -> (0, ∞)
+        self.phase    = nn.Parameter(torch.zeros(n_freq, d_in))
+
+        # Linear projection to d_out
+        self.proj = nn.Linear(n_freq * d_in, d_out)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, y: Tensor) -> Tensor:
+        """
+        y: [E, d_in] (float). Recommended to be roughly standardized.
+        """
+        # [E, d_in] -> [1, E, d_in] to broadcast over frequencies
+        y_exp = y.unsqueeze(0)                                     # [1, E, d_in]
+        freq  = torch.exp(self.log_freq).unsqueeze(1)              # [F, 1, d_in]
+        phase = self.phase.unsqueeze(1)                            # [F, 1, d_in]
+
+        # Cosine features: [F, E, d_in]
+        c = torch.cos(y_exp * freq + phase)
+
+        # Collapse to [E, F*d_in]
+        c = c.permute(1, 0, 2).reshape(y.shape[0], -1)
+
+        out = self.proj(c)                                         # [E, d_out]
+        out = self.dropout(torch.nn.functional.gelu(out))
+        return out
 
 class HGTStarPredictor(nn.Module):
     """
     HGT-based heterogeneous GNN for predicting review stars on edges.
-
-    We embed node IDs from the LinkNeighborLoader mini-batch (batch[nt].n_id),
-    so input "features" are just indices per node type.
     """
 
     def __init__(
         self,
         metadata,
         num_nodes: Dict[str, int],
-        in_dims: Dict[str, int],                 # kept for API compatibility; unused with embeddings
         hidden_dim: int,
         num_layers: int = 3,
         num_heads: int = 4,
         dropout: float = 0.1,
         edge_attr_dim: Optional[int] = 301,      # e.g., 300 word2vec + 1 time
-        use_edge_attr_on: Optional[set] = None,  # restrict which relations inject edge_attr (None = auto)
+        use_edge_attr_on: Optional[set] = None,
+        time_out: Optional[int] = 16,
         out_mode: str = "ordinal",
     ):
         super().__init__()
@@ -58,6 +95,20 @@ class HGTStarPredictor(nn.Module):
             for _ in range(num_layers)
         ])
 
+        # Temporal encoding for edge timestamps
+        if time_out is not None:
+            self.time_enc = RelTemporalEncoding(d_in=1, n_freq=8, d_out=time_out, dropout=dropout)
+
+        # Edge head: [h_src || h_dst] (+ optional projected edge_attr of labeled edges)
+        self.use_edge_text_at_head = (self.edge_attr_dim is not None)
+        if time_out is not None and self.edge_attr_dim is not None:
+            self.edge_attr_dim = self.edge_attr_dim + time_out
+            self.edge_text_proj = nn.Linear(self.edge_attr_dim, self.hidden_dim)
+            pred_in = 2 * self.hidden_dim + self.hidden_dim
+        else:
+            self.edge_text_proj = None
+            pred_in = 2 * self.hidden_dim + (self.hidden_dim if self.use_edge_text_at_head else 0)
+
         # Edge-attr residual injection path
         if self.edge_attr_dim is not None:
             self.edge_attr_proj = nn.Linear(self.edge_attr_dim, hidden_dim)
@@ -68,15 +119,6 @@ class HGTStarPredictor(nn.Module):
         else:
             self.edge_attr_proj = None
             self.edge_res_gate = None
-
-        # Edge head: [h_src || h_dst] (+ optional projected edge_attr of labeled edges)
-        self.use_edge_text_at_head = (self.edge_attr_dim is not None)
-        if self.use_edge_text_at_head:
-            self.edge_text_proj = nn.Linear(self.edge_attr_dim, self.hidden_dim)
-            pred_in = 2 * self.hidden_dim + self.hidden_dim
-        else:
-            self.edge_text_proj = None
-            pred_in = 2 * self.hidden_dim
 
         pred_out = 4 if self.out_mode == "ordinal" else 5
         self.edge_pred = nn.Sequential(
@@ -118,7 +160,7 @@ class HGTStarPredictor(nn.Module):
 
     def encode_nodes(
         self,
-        batch,  # HeteroData mini-batch; we use batch[nt].n_id as indices
+        batch,
         edge_index_dict: Dict[Tuple[str, str, str], Tensor],
         edge_attr_dict: Optional[Dict[Tuple[str, str, str], Tensor]] = None,
     ) -> Dict[str, Tensor]:
@@ -152,25 +194,46 @@ class HGTStarPredictor(nn.Module):
 
     def forward(
         self,
-        x_dict: Dict[str, Tensor],  # ignored; kept for signature compatibility
         edge_index_dict: Dict[Tuple[str, str, str], Tensor],
         *,
         edge_label_index: Tensor,
-        edge_type: Tuple[str, str, str],
+        label_edge_type: Tuple[str, str, str],
         batch=None,
     ) -> Tensor:
+        
+        time_tensor = None
+        for edge_type in batch.edge_types:
+            if edge_type == ('business', 'rev_reviews', 'user'):
+                empty = torch.empty((batch[edge_type].num_edges, self.time_enc.d_out), device=batch[edge_type].edge_index.device)
+                batch[edge_type].edge_attr = torch.cat([batch[edge_type].edge_attr, empty], dim=-1)
+                continue
+            rel_store = batch[edge_type]
+            if hasattr(rel_store, "edge_attr"):
+                # If you’ve packed time into the last column of edge_attr,
+                # slice it out and align like above.
+                eattr = rel_store.edge_attr
+                time_tensor = eattr[:, -1]
+
+                t = time_tensor.view(-1, 1)
+                t_mu  = t.mean(dim=0, keepdim=True)
+                t_std = t.std(dim=0, keepdim=True).clamp_min(1e-6)
+                t_z   = (t - t_mu) / t_std
+                t_emb = self.time_enc(t_z)
+                batch[edge_type].edge_attr = torch.cat([batch[edge_type].edge_attr, t_emb], dim=-1)
+            
+
         edge_attr_dict = self._collect_edge_attr_dict(batch, edge_index_dict)
         h_dict = self.encode_nodes(batch, edge_index_dict, edge_attr_dict)
 
-        src_type, _, dst_type = edge_type
+        src_type, _, dst_type = label_edge_type
         src, dst = edge_label_index
         h_src = h_dict[src_type][src]
         h_dst = h_dict[dst_type][dst]
         z = torch.cat([h_src, h_dst], dim=-1)
 
-        if self.use_edge_text_at_head and batch is not None and hasattr(batch[edge_type], "edge_attr"):
+        if self.use_edge_text_at_head and batch is not None and hasattr(batch[label_edge_type], "edge_attr"):
             M = edge_label_index.size(1)
-            e_text = self.edge_text_proj(batch[edge_type].edge_attr[:M])
+            e_text = self.edge_text_proj(batch[label_edge_type].edge_attr[:M])
             z = torch.cat([z, e_text], dim=-1)
 
         return self.edge_pred(z)

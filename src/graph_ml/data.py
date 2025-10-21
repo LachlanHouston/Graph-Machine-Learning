@@ -232,8 +232,6 @@ def load_yelp_as_hetero(
         data[FRIENDS].time = torch.full((Ef,), min_year - 1, dtype=torch.long)
 
     # ----- make the entire hetero graph undirected -----
-    # On HeteroData, ToUndirected() will add reverse edges (and reverse edge types when needed)
-    # and copy edge attributes (merged with `reduce` if duplicates occur).
     data = T.ToUndirected(reduce="add", merge=True)(data)
 
     # shape hygiene: ensure times are 1-D
