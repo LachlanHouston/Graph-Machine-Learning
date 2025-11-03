@@ -1,25 +1,23 @@
-# data.py (PyG 2.6.1)
-
 from __future__ import annotations
 
 import json, re
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Dict
 
 import numpy as np
 import torch
 from torch import Tensor
 from torch_geometric.data import HeteroData
 import torch_geometric.transforms as T
+from torch_geometric.utils import negative_sampling
 
 from graph_ml.utils import set_seed
 
-# ---------- Constants / Schema ----------
 USER = "user"
 BUS  = "business"
 
-REL     = (USER, "reviews", BUS)       # forward review relation
-FRIENDS = (USER, "friends", USER)      # user-user
+REL     = (USER, "reviews", BUS)
+FRIENDS = (USER, "friends", USER)
 
 # ---------- Word2Vec (lazy, cached) ----------
 _W2V = None
@@ -277,6 +275,29 @@ def split_edge_indices(
     train_idx = torch.as_tensor(idx[n_test + n_val:], dtype=torch.long)
     return train_idx, val_idx, test_idx
 
+def check_uniform_edge_attr_dim(data: HeteroData, rel_a, rel_b, expect_dim: Optional[int] = None):
+    """
+    Ensure all relations used by the model expose the same edge_attr width.
+    This is required for HEATConv (single edge_dim across edge types).
+    """
+    dims: Dict[Tuple[str, str, str], int] = {}
+    for et in (rel_a, rel_b):
+        if hasattr(data[et], "edge_attr") and data[et].edge_attr is not None:
+            dims[et] = int(data[et].edge_attr.size(-1))
+        else:
+            dims[et] = 0
+    # If friends had no attrs, create a red flag (HEATConv expects a uniform width).
+    if dims[rel_b] == 0 and dims[rel_a] > 0:
+        raise RuntimeError(
+            f"{rel_b} has no edge_attr but {rel_a} has dim={dims[rel_a]}. "
+            f"Provide zero edge_attr of the same width for {rel_b} (e.g., torch.zeros(E_f, {dims[rel_a]}))."
+        )
+    if expect_dim is not None and dims[rel_a] != expect_dim:
+        raise RuntimeError(f"{rel_a} edge_attr dim mismatch: got {dims[rel_a]} vs expect {expect_dim}")
+    if dims[rel_a] != dims[rel_b]:
+        raise RuntimeError(f"edge_attr dims differ across relations: {rel_a}->{dims[rel_a]}, {rel_b}->{dims[rel_b]}")
+    return dims[rel_a]
+
 def split_edge_indices_by_year(
     data: HeteroData,
     rel: Tuple[str, str, str] = REL,
@@ -285,6 +306,10 @@ def split_edge_indices_by_year(
     shuffle_within_splits: bool = False,
     seed: int = 42,
 ) -> Tuple[Tensor, Tensor]:
+    """
+    Temporal split of review edges by `data[rel].time` (1-D int tensor of years).
+    Returns train_idx, val_idx (indices into data[rel].edge_index).
+    """
     years = data[rel].time.view(-1)
     if include_boundary_in_train:
         train_mask = years <= boundary_year
@@ -297,8 +322,7 @@ def split_edge_indices_by_year(
     val_idx = val_mask.nonzero(as_tuple=False).view(-1).to(torch.long)
 
     if shuffle_within_splits:
-        g = torch.Generator()
-        g.manual_seed(seed)
+        g = torch.Generator().manual_seed(seed)
         train_idx = train_idx[torch.randperm(train_idx.numel(), generator=g)]
         val_idx = val_idx[torch.randperm(val_idx.numel(), generator=g)]
 
@@ -306,7 +330,6 @@ def split_edge_indices_by_year(
         raise RuntimeError(
             f"Temporal split produced empty set(s): "
             f"train={train_idx.numel()}, val={val_idx.numel()}. "
-            f"Check boundary_year={boundary_year} "
-            f"and your data years (min={int(years.min())}, max={int(years.max())})."
+            f"boundary_year={boundary_year}, years(min={int(years.min())}, max={int(years.max())})."
         )
     return train_idx, val_idx

@@ -10,8 +10,9 @@ from tqdm import tqdm
 from torch_geometric.loader import LinkNeighborLoader
 
 
-from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year
-from graph_ml.model import HGTStarPredictor
+from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year, check_uniform_edge_attr_dim
+# from graph_ml.model import HGTStarPredictor # Old implementation
+from graph_ml.model_HEAT import HeteroHEATStarPredictor
 from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits, log_confmatrix
 
 try:
@@ -31,10 +32,8 @@ def ordinal_targets(y):
 def main(cfg: DictConfig):
     # Pretty-print the composed config
     print(OmegaConf.to_yaml(cfg, resolve=True))
-
     set_seed(cfg.data.seed)
 
-    # Resolve any file system paths that should be relative to original CWD
     data_dir = to_absolute_path(cfg.data.data_dir)
 
     device = torch.device(f"cuda:{cfg.data.cuda}" if torch.cuda.is_available() else "cpu")
@@ -56,15 +55,23 @@ def main(cfg: DictConfig):
 
     print(data.metadata())
 
-    for nt in data.node_types:
-            if not hasattr(data[nt], "x"):
-                data[nt].x = torch.arange(data[nt].num_nodes)
-
-    num_nodes = {nt: data[nt].num_nodes for nt in data.node_types}
+    edge_attr_dim = check_uniform_edge_attr_dim(data, rel, ("user", "friends", "user"))
 
     train_idx, val_idx = split_edge_indices_by_year(
         data, rel=rel, boundary_year=2017, include_boundary_in_train=True
     )
+
+    # Seed edge pairs (positives only)
+    train_pos = data[rel].edge_index[:, train_idx]
+    val_pos   = data[rel].edge_index[:, val_idx]
+
+    # Star labels 1..5 for those edges
+    train_stars = data[rel].edge_label[train_idx]   # [P_train]
+    val_stars   = data[rel].edge_label[val_idx]     # [P_val]
+
+    years = data[rel].time.view(-1)
+    train_years = years[train_idx]
+    val_years   = years[val_idx]
 
     num_neighbors = build_num_neighbors_from_cfg(cfg)
 
@@ -82,41 +89,33 @@ def main(cfg: DictConfig):
         pin_memory=(device.type == "cuda"),
         persistent_workers=(num_workers > 0),
         prefetch_factor=prefetch_factor,
+        time_attr='time',
     )
-
-    stars = data[rel].edge_label
-    years = data[rel].time.squeeze()
-    train_label = stars[train_idx]
-    val_label = stars[val_idx]
 
     train_loader = LinkNeighborLoader(
         **common_kwargs,
-        edge_label_index=(rel, data[rel].edge_index[:, train_idx]),
-        edge_label=train_label,
-        edge_label_time=years[train_idx],
-        time_attr="time",
+        edge_label_index=(rel, train_pos),
+        edge_label=train_stars,       # stars ∈ {1..5}
+        edge_label_time=train_years,  # per-seed times
     )
 
     val_loader = LinkNeighborLoader(
         **{**common_kwargs, "shuffle": False},
-        edge_label_index=(rel, data[rel].edge_index[:, val_idx]),
-        edge_label=val_label,
-        edge_label_time=years[val_idx],
-        time_attr="time",
+        edge_label_index=(rel, val_pos),
+        edge_label=val_stars,
+        edge_label_time=val_years,
     )
 
-    edge_attr_dim = int(data[rel].edge_attr.size(-1)) if hasattr(data[rel], "edge_attr") else None
-
-    model = HGTStarPredictor(
+    model = HeteroHEATStarPredictor(
         metadata=data.metadata(),
-        num_nodes=num_nodes,
-        hidden_dim=cfg.model.n_hid,
-        num_layers=cfg.model.n_layers,
-        num_heads=cfg.model.n_heads,
-        dropout=cfg.model.dropout,
+        num_nodes={nt: int(data[nt].num_nodes) for nt in data.node_types},
+        hidden_dim=256,
+        num_layers=3,
+        num_heads=4,
+        dropout=0.1,
         edge_attr_dim=edge_attr_dim,
-        out_mode="ordinal",
     ).to(device)
+
 
     print('Number of Parameters for Total model:', get_n_params(model))
     param_optimizer = list(model.named_parameters())
@@ -168,11 +167,11 @@ def main(cfg: DictConfig):
 
             with torch.cuda.amp.autocast(enabled=use_amp):
                 out = model(
-                    batch.edge_index_dict,
                     edge_label_index=batch[rel].edge_label_index,
                     label_edge_type=rel,
                     batch=batch,
                 )
+
                 t = ordinal_targets(y_train)
                 loss = F.binary_cross_entropy_with_logits(out, t, pos_weight=pos_w)
 
@@ -206,7 +205,6 @@ def main(cfg: DictConfig):
                 batch = batch.to(device, non_blocking=True)
                 y = batch[rel].edge_label.float()
                 out = model(
-                    batch.edge_index_dict,
                     edge_label_index=batch[rel].edge_label_index,
                     label_edge_type=rel,
                     batch=batch,
