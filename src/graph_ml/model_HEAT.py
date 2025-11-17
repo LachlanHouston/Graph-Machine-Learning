@@ -4,11 +4,12 @@ from typing import Dict, Tuple, Optional
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.nn import HEATConv
-import torch.nn.functional as F
 
 REL = ('user', 'reviews', 'business')
+
 
 class RelTemporalEncoding(nn.Module):
     """
@@ -17,7 +18,7 @@ class RelTemporalEncoding(nn.Module):
     """
     def __init__(self, n_hid: int, max_len: int = 240, dropout: float = 0.0):
         super().__init__()
-        position = torch.arange(0., max_len).unsqueeze(1)
+        position = torch.arange(0., max_len).unsqueeze(1)  # [max_len, 1]
         div_term = torch.exp(torch.arange(0, n_hid, 2) * -(math.log(10000.0) / n_hid))
 
         emb = nn.Embedding(max_len, n_hid)
@@ -36,8 +37,9 @@ class RelTemporalEncoding(nn.Module):
         """
         if t_idx.dim() > 1:
             t_idx = t_idx.view(-1)
-        enc = self.lin(self.emb(t_idx))
+        enc = self.lin(self.emb(t_idx))        # [E, n_hid]
         return self.dropout(enc)
+
 
 class GlobalTransformer(nn.Module):
     """
@@ -56,23 +58,34 @@ class GlobalTransformer(nn.Module):
         self.ln2  = nn.LayerNorm(d_model)
         self.do   = nn.Dropout(dropout)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: Tensor) -> Tensor:
+        """
+        h: [N, d_model] (nodes in the subgraph)
+        returns: [N, d_model]
+        """
+        # Treat nodes as a length-N sequence, batch size = 1
         x = h.unsqueeze(1)
-        x2, _ = self.attn(x, x, x)      # global attention across all nodes
+        x2, _ = self.attn(x, x, x)  # self-attention over all nodes
         x = self.ln1(x + self.do(x2))
         x2 = self.ffn(x)
         x = self.ln2(x + self.do(x2))
-        return x.squeeze(1)
+        return x.squeeze(1)         # [N, d_model]
+
 
 class HeteroHEATStarPredictor(nn.Module):
     """
     Rating prediction (1..5) on review edges using HEATConv.
+    - Uses node features `x` (same width for all node types) as input, no ID embeddings.
+    - Hetero -> homo via `batch.to_homogeneous(node_attrs=['x'], edge_attrs=['edge_attr','time'])`.
+    - First HEATConv layer consumes raw node features; later layers operate in `hidden_dim`.
+    - Edge attributes are augmented with temporal encoding and passed via `edge_dim`.
+    - Output is 4 logits (ordinal setup: thresholds between stars 1..5).
     """
 
     def __init__(
         self,
         metadata,
-        num_nodes: Dict[str, int],
+        node_feat_dim: int,
         hidden_dim: int,
         num_layers: int = 3,
         num_heads: int = 4,
@@ -90,28 +103,46 @@ class HeteroHEATStarPredictor(nn.Module):
         self.edge_types = list(metadata[1])
         self.node_type_to_id = {nt: i for i, nt in enumerate(self.node_types)}
 
+        self.node_feat_dim = int(node_feat_dim)
         self.hidden_dim = hidden_dim
 
+        # Temporal encoding for edges
         self.time_out = int(time_out) if time_out is not None else 0
         self.max_time_len = int(max_time_len)
         self.base_time = base_time
         self.time_enc = RelTemporalEncoding(n_hid=self.time_out, max_len=self.max_time_len, dropout=dropout)
 
+        # Edge attr dims: data attrs + time encoding
         self.edge_attr_dim_data = int(edge_attr_dim or 0)
         self.edge_attr_dim_total = self.edge_attr_dim_data + self.time_out
 
-        self.embeds = nn.ModuleDict({
-            nt: nn.Embedding(num_embeddings=num_nodes[nt], embedding_dim=hidden_dim)
-            for nt in self.node_types
-        })
-
+        # Global Transformer blocks (one per HEAT layer)
         self.global_blocks = nn.ModuleList(
-            [GlobalTransformer(d_model=hidden_dim, n_heads=num_heads, dropout=dropout) for _ in range(num_layers)]
+            [GlobalTransformer(d_model=hidden_dim, n_heads=num_heads, dropout=dropout)
+             for _ in range(num_layers)]
         )
         self.local_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
 
+        # HEATConv stack
         convs = []
-        for _ in range(num_layers):
+
+        # First layer: in_channels = node_feat_dim, out_channels = hidden_dim
+        convs.append(HEATConv(
+            in_channels=self.node_feat_dim,
+            out_channels=hidden_dim,
+            num_node_types=len(self.node_types),
+            num_edge_types=len(self.edge_types),
+            heads=num_heads,
+            concat=concat_heads,
+            dropout=dropout,
+            edge_dim=self.edge_attr_dim_total,
+            edge_attr_emb_dim=edge_attr_emb_dim,
+            edge_type_emb_dim=edge_type_emb_dim,
+            bias=True,
+        ))
+
+        # Subsequent layers: in_channels = hidden_dim
+        for _ in range(1, num_layers):
             convs.append(HEATConv(
                 in_channels=hidden_dim,
                 out_channels=hidden_dim,
@@ -126,8 +157,12 @@ class HeteroHEATStarPredictor(nn.Module):
                 bias=True,
             ))
         self.convs = nn.ModuleList(convs)
-        self.post_lin = nn.Linear(num_heads * hidden_dim, hidden_dim) if concat_heads else nn.Identity()
 
+        # If concat=True, HEATConv output dim = heads * out_channels
+        out_per_layer = hidden_dim * num_heads if concat_heads else hidden_dim
+        self.post_lin = nn.Linear(out_per_layer, hidden_dim) if concat_heads else nn.Identity()
+
+        # Edge prediction head: [h_src || h_dst] -> 4 logits (ordinal)
         pred_in = 2 * hidden_dim
         pred_out = 4
         self.edge_pred = nn.Sequential(
@@ -140,8 +175,11 @@ class HeteroHEATStarPredictor(nn.Module):
         self.act = nn.ReLU()
         self.do = nn.Dropout(dropout)
 
+    # ---------- helpers ----------
+
     @staticmethod
     def _positions_by_type(node_type: Tensor, t_id: int) -> Tensor:
+        # Homogeneous positions of nodes with this type id.
         return (node_type == t_id).nonzero(as_tuple=False).view(-1)
 
     def _time_to_index(self, t_raw: Tensor) -> Tensor:
@@ -157,44 +195,62 @@ class HeteroHEATStarPredictor(nn.Module):
         return idx
 
     def _build_homo_inputs(self, batch):
-        homo = batch.to_homogeneous(node_attrs=[], edge_attrs=['edge_attr', 'time'])
+        """
+        Build homogeneous view and edge attributes with time encoding.
+
+        Returns:
+          x_h   : [N_h, node_feat_dim]   (raw node features, same width for all types)
+          ei_h  : [2, E_h]
+          nt_h  : [N_h] (long node_type ids)
+          et_h  : [E_h] (long edge_type ids)
+          ea_h  : [E_h, edge_attr_dim_total]
+          pos_idx_by_type: Dict[str, Tensor] mapping type -> homogeneous positions
+        """
+        # Hetero -> homo, carrying node features `x` + edge_attr + time
+        homo = batch.to_homogeneous(node_attrs=['x'], edge_attrs=['edge_attr', 'time'])
+        x_h  = homo.x           # [N_h, node_feat_dim]
         ei_h = homo.edge_index
         nt_h = homo.node_type
         et_h = homo.edge_type
 
         device = ei_h.device
-        d = self.hidden_dim
         N_h = nt_h.numel()
 
-        pos_idx_by_type: Dict[str, Tensor] = {}
-        for nt, t_id in self.node_type_to_id.items():
-            pos_idx_by_type[nt] = self._positions_by_type(nt_h, t_id)
+        if x_h.size(-1) != self.node_feat_dim:
+            raise RuntimeError(f"Expected node_feat_dim={self.node_feat_dim}, "
+                               f"got x.size(-1)={x_h.size(-1)} from homogeneous graph.")
 
-        x_h = torch.zeros((N_h, d), device=device, dtype=torch.float32)
-        for nt in self.node_types:
-            pos = pos_idx_by_type[nt]
-            if pos.numel() == 0:
-                continue
-            assert hasattr(batch[nt], 'n_id'), f"batch[{nt}] missing n_id"
-            global_ids = batch[nt].n_id.to(device=device)
-            x_h[pos] = self.embeds[nt](global_ids)
+        x_h = x_h.to(device=device, dtype=torch.float32)
+
+        # Homogeneous positions per type
+        pos_idx_by_type: Dict[str, Tensor] = {
+            nt: self._positions_by_type(nt_h, t_id)
+            for nt, t_id in self.node_type_to_id.items()
+        }
 
         # Construct edge_attr fed to HEATConv: [edge_attr || time_enc]
         ea_data = getattr(homo, 'edge_attr', None)
         if ea_data is None:
             if self.edge_attr_dim_data != 0:
-                raise RuntimeError("Homogeneous graph has no edge_attr but edge_attr_dim_data > 0. "
-                                   "Ensure data[*].edge_attr exists for all relations or set edge_attr_dim to 0.")
+                raise RuntimeError(
+                    "Homogeneous graph has no edge_attr but edge_attr_dim_data > 0. "
+                    "Ensure data[*].edge_attr exists for all relations or set edge_attr_dim=0."
+                )
             ea_data = torch.empty((ei_h.size(1), 0), device=device, dtype=torch.float32)
+        else:
+            ea_data = ea_data.to(device=device, dtype=torch.float32)
 
         if not hasattr(homo, 'time'):
-            raise RuntimeError("Homogeneous graph is missing 'time'. Make sure edge_attrs=['edge_attr','time'] are passed.")
+            raise RuntimeError("Homogeneous graph is missing 'time'. "
+                               "Make sure edge_attrs=['edge_attr','time'] are passed to to_homogeneous.")
         t_idx = self._time_to_index(homo.time)
-        t_enc = self.time_enc(t_idx.to(device=device))
+        t_enc = self.time_enc(t_idx.to(device=device))   # [E_h, time_out]
 
-        ea_h = torch.cat([ea_data, t_enc], dim=-1)
+        ea_h = torch.cat([ea_data, t_enc], dim=-1)       # [E_h, edge_attr_dim_total]
         if ea_h.size(-1) != self.edge_attr_dim_total:
-            raise RuntimeError(f"edge_attr dim mismatch: got {ea_h.size(-1)}, expected {self.edge_attr_dim_total}")
+            raise RuntimeError(
+                f"edge_attr dim mismatch: got {ea_h.size(-1)}, expected {self.edge_attr_dim_total}"
+            )
 
         return x_h, ei_h, nt_h, et_h, ea_h, pos_idx_by_type
 
@@ -204,6 +260,10 @@ class HeteroHEATStarPredictor(nn.Module):
         label_edge_type: Tuple[str, str, str],
         pos_idx_by_type: Dict[str, Tensor],
     ) -> Tensor:
+        """
+        Map hetero (src,dst) indices for the given relation to homogeneous indices
+        using the positions list for each node type.
+        """
         src_type, _, dst_type = label_edge_type
         src_local, dst_local = edge_label_index
         src_h = pos_idx_by_type[src_type][src_local]
@@ -219,11 +279,14 @@ class HeteroHEATStarPredictor(nn.Module):
         label_edge_type: Tuple[str, str, str],
         batch=None,
     ) -> Tensor:
-        # 1) Build homogeneous inputs and time-augmented edge_attr
+        """
+        Forward pass for a mini-batch produced by LinkNeighborLoader.
+        """
+        # 1) Build homogeneous inputs
         x_h, ei_h, nt_h, et_h, ea_h, pos_idx_by_type = self._build_homo_inputs(batch)
 
-        # 2) HEATConv stack (consumes time-augmented edge_attr)
-        h = x_h  # [N_h, d]
+        # 2) HEATConv stack
+        h = x_h
         for li, conv in enumerate(self.convs):
             h_loc = conv(
                 x=h,
@@ -232,17 +295,23 @@ class HeteroHEATStarPredictor(nn.Module):
                 edge_type=et_h,
                 edge_attr=ea_h,
             )
-            h_loc = self.post_lin(h_loc)
+            h_loc = self.post_lin(h_loc)   # -> [N_h, hidden_dim] if concat_heads, else identity
             h_loc = F.relu(h_loc)
             h_loc = self.do(h_loc)
-            # Residual + norm after local
-            h = self.local_norms[li](h + h_loc)
 
-            h_glob = self.global_blocks[li](h)      # full-graph self-attention
+            if li == 0:
+                # First layer: no residual from pre-conv features, just take transformed h_loc
+                h = h_loc
+            else:
+                # Later layers: residual + layer norm in hidden_dim
+                h = self.local_norms[li](h + h_loc)
+
+            # Global transformer block
+            h_glob = self.global_blocks[li](h)
             h = h + h_glob
 
         # 3) Score target pairs for the review relation
         edge_label_index_h = self._hetero_pairs_to_homo(edge_label_index, label_edge_type, pos_idx_by_type)
         src_h, dst_h = edge_label_index_h
         z = torch.cat([h[src_h], h[dst_h]], dim=-1)
-        return self.edge_pred(z)
+        return self.edge_pred(z)                        # [M, 4] (ordinal logits)

@@ -11,7 +11,6 @@ from torch_geometric.loader import LinkNeighborLoader
 
 
 from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year, check_uniform_edge_attr_dim
-# from graph_ml.model import HGTStarPredictor # Old implementation
 from graph_ml.model_HEAT import HeteroHEATStarPredictor
 from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits, log_confmatrix
 
@@ -108,25 +107,17 @@ def main(cfg: DictConfig):
 
     model = HeteroHEATStarPredictor(
         metadata=data.metadata(),
-        num_nodes={nt: int(data[nt].num_nodes) for nt in data.node_types},
-        hidden_dim=256,
-        num_layers=3,
-        num_heads=4,
-        dropout=0.1,
+        node_feat_dim=data['user'].x.size(1),
+        hidden_dim=cfg.model.n_hid,
+        num_layers=cfg.model.n_layers,
+        num_heads=cfg.model.n_heads,
+        dropout=cfg.model.dropout,
         edge_attr_dim=edge_attr_dim,
     ).to(device)
 
-
     print('Number of Parameters for Total model:', get_n_params(model))
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer = torch.optim.AdamW(
-        [
-            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-             'weight_decay': cfg.train.weight_decay},
-            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
-             'weight_decay': 0.0}
-        ],
+        params = model.parameters(),
         lr=cfg.train.lr,
         eps=1e-8
     )
@@ -157,23 +148,30 @@ def main(cfg: DictConfig):
     for epoch in epoch_bar:
         model.train()
         total_loss = 0.0
-        steps = 0
 
-        batch_bar = tqdm(total=cfg.train.n_batch, desc="Train batches", leave=False)
-        for steps, batch in zip(range(cfg.train.n_batch), train_loader):
+        y_true_stars = []
+        y_pred_stars = []
+
+        batch_bar = tqdm(train_loader, desc="Train batches", leave=False)
+        for batch in batch_bar:
             batch = batch.to(device)
             y_train = batch[rel].edge_label.float()
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                out = model(
-                    edge_label_index=batch[rel].edge_label_index,
-                    label_edge_type=rel,
-                    batch=batch,
-                )
+            out = model(
+                edge_label_index=batch[rel].edge_label_index,
+                label_edge_type=rel,
+                batch=batch,
+            )
 
-                t = ordinal_targets(y_train)
-                loss = F.binary_cross_entropy_with_logits(out, t, pos_weight=pos_w)
+            t = ordinal_targets(y_train)
+            loss = F.binary_cross_entropy_with_logits(out, t, pos_weight=pos_w)
+
+            probs = torch.sigmoid(out)
+            preds = 1 + (probs > 0.5).sum(dim=1)
+
+            y_true_stars.append(y_train)
+            y_pred_stars.append(preds)
 
             loss.backward()
             if cfg.train.clip and cfg.train.clip > 0:
@@ -181,15 +179,23 @@ def main(cfg: DictConfig):
             optimizer.step()
 
             total_loss += loss.item()
-            batch_bar.update(1)
-            batch_bar.set_postfix(loss=f"{loss.item():.4f}")
 
+            batch_bar.set_postfix(loss=f"{loss.item():.4f}")
             if run is not None and train_step % 10 == 0:
                 wandb.log({'train/loss': loss.item()}, step=train_step)
             train_step += 1
 
         batch_bar.close()
-        avg_loss = total_loss / max(1, steps + 1)
+        avg_loss = total_loss / max(1, len(train_loader))
+
+        # compute train_acc over *all* batches this epoch
+        y_true = torch.cat(y_true_stars).float()
+        y_pred = torch.cat(y_pred_stars).float()
+        y_true_i = y_true.clamp(1, 5).round().int().cpu()
+        y_pred_i = y_pred.clamp(1, 5).round().int().cpu()
+        train_acc = (y_true_i == y_pred_i).float().mean().item()
+
+        epoch_bar.set_postfix({'train_acc': f'{train_acc:.4f}'})
 
         model.eval()
         y_true_stars = [] 
@@ -200,7 +206,7 @@ def main(cfg: DictConfig):
         se_sum = 0.0
         n_sum = 0
 
-        with torch.inference_mode(), torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Val", leave=False, dynamic_ncols=True):
                 batch = batch.to(device, non_blocking=True)
                 y = batch[rel].edge_label.float()
@@ -251,7 +257,7 @@ def main(cfg: DictConfig):
         )
 
         if run is not None:
-            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'val/loss': val_loss, 'val/rmse': val_rmse, 'val_acc': val_acc,
+            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'train/acc': train_acc, 'val/loss': val_loss, 'val/rmse': val_rmse, 'val_acc': val_acc,
                        'val/f1_micro': f1_micro, 'val/f1_macro': f1_macro}, step=train_step)
 
         if val_rmse < best_val:

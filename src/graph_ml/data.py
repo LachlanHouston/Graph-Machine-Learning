@@ -131,18 +131,25 @@ def load_yelp_as_hetero(
     if not rev_rows:
         raise RuntimeError("No reviews loaded. Increase max_reviews or lower min_review_len.")
 
-    # ----- collect valid ids -----
+    # ----- collect valid ids + review_count from json -----
     user_ids, biz_ids = set(), set()
+    user_rc_json: Dict[str, int] = {}   # user_id -> review_count from user.json
+    biz_rc_json:  Dict[str, int] = {}   # business_id -> review_count from business.json
+
     with fp_user.open("r", encoding="utf-8") as fh:
         for line in fh:
             j = json.loads(line)
             if (uid := j.get("user_id")):
                 user_ids.add(uid)
+                user_rc_json[uid] = int(j.get("review_count", 0) or 0)
+
     with fp_biz.open("r", encoding="utf-8") as fh:
         for line in fh:
             j = json.loads(line)
             if (bid := j.get("business_id")):
                 biz_ids.add(bid)
+                biz_rc_json[bid] = int(j.get("review_count", 0) or 0)
+
 
     # ----- keep only overlapping reviews (and align embeddings) -----
     if use_text_edge_attr:
@@ -172,14 +179,42 @@ def load_yelp_as_hetero(
     stars = np.fromiter((s for (*_, s, _) in rev_rows), dtype=np.float32)
     years = np.fromiter((y for (*_, y) in rev_rows), dtype=np.int16)
 
+    # ----- degrees in the (filtered) reviews bipartite graph -----
+    # Users: how many reviews they wrote in *this* processed set
+    deg_user_rev = np.bincount(u_idx, minlength=len(u2i)).astype(np.int64)          # [N_user]
+    # Businesses: how many reviews they received in *this* processed set
+    deg_biz_rev  = np.bincount(b_idx, minlength=len(b2i)).astype(np.int64)          # [N_biz]
+
     # ----- build heterodata -----
     data = HeteroData()
     data[USER].num_nodes = len(uniq_users)
     data[BUS].num_nodes  = len(uniq_biz)
 
-    # minimal node features so in_dims are known
-    data[USER].x = torch.ones((data[USER].num_nodes, 1), dtype=torch.float32)
-    data[BUS].x  = torch.ones((data[BUS].num_nodes, 1), dtype=torch.float32)
+    # ---------- node features ----------
+    # Users: [log1p(review_count_json), log1p(degree_in_reviews_graph)]
+    user_feat = np.zeros((len(u2i), 2), dtype=np.float32)
+    for uid, i in u2i.items():
+        rc_json = user_rc_json.get(uid, 0)
+        user_feat[i, 0] = np.log1p(rc_json)
+        user_feat[i, 1] = np.log1p(deg_user_rev[i])
+
+    # Businesses: [log1p(review_count_json), log1p(degree_in_reviews_graph)]
+    biz_feat = np.zeros((len(b2i), 2), dtype=np.float32)
+    for bid, j in b2i.items():
+        rc_json = biz_rc_json.get(bid, 0)
+        biz_feat[j, 0] = np.log1p(rc_json)
+        biz_feat[j, 1] = np.log1p(deg_biz_rev[j])
+
+    # (Optional) z-score each column independently (uncomment if you prefer normalized features)
+    # for c in range(user_feat.shape[1]):
+    #     mu, sigma = user_feat[:, c].mean(), user_feat[:, c].std() + 1e-6
+    #     user_feat[:, c] = (user_feat[:, c] - mu) / sigma
+    # for c in range(biz_feat.shape[1]):
+    #     mu, sigma = biz_feat[:, c].mean(), biz_feat[:, c].std() + 1e-6
+    #     biz_feat[:, c] = (biz_feat[:, c] - mu) / sigma
+
+    data[USER].x = torch.tensor(user_feat, dtype=torch.float32)
+    data[BUS].x  = torch.tensor(biz_feat,  dtype=torch.float32)
 
     edge_index = torch.tensor(np.vstack([u_idx, b_idx]), dtype=torch.long)
     data[REL].edge_index = edge_index
