@@ -19,6 +19,34 @@ BUS  = "business"
 REL     = (USER, "reviews", BUS)
 FRIENDS = (USER, "friends", USER)
 
+_SENT = None
+
+def _get_sentiment_analyzer():
+    """
+    Returns a VADER sentiment analyzer.
+    Prefers vaderSentiment package, falls back to nltk if available.
+    """
+    global _SENT
+    if _SENT is None:
+        try:
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+            _SENT = SentimentIntensityAnalyzer()
+        except Exception:
+            print("vaderSentiment not available")
+            return None
+    return _SENT
+
+def _vader_scores(text: str, *, mode: str = "vader4", analyser=None) -> np.ndarray:
+    """
+    mode:
+      - "vader4": [neg, neu, pos, compound]
+      - "compound": [compound]
+    """
+    s = analyser.polarity_scores(text or "")
+    if mode == "compound":
+        return np.array([s["compound"]], dtype=np.float32)
+    return np.array([s["neg"], s["neu"], s["pos"], s["compound"]], dtype=np.float32)
+
 # ---------- Word2Vec (lazy, cached) ----------
 _W2V = None
 _W2V_DIM_DEFAULT = 300
@@ -68,6 +96,9 @@ def load_yelp_as_hetero(
     use_text_edge_attr: bool = True,
     w2v_model_name: str = "word2vec-google-news-300",
     w2v_dim: Optional[int] = None,
+    use_sentiment_edge_attr: bool = True,
+    sentiment_mode: str = "vader4",   # "vader4" or "compound"
+    zscore_sentiment: bool = False,   # optional normalization
 ) -> HeteroData:
 
     set_seed(seed)
@@ -97,9 +128,16 @@ def load_yelp_as_hetero(
         w2v = None
         w2v_dim_eff = 0
 
+    if use_sentiment_edge_attr:
+        sent_dim_eff = 4 if sentiment_mode == "vader4" else 1
+        an = _get_sentiment_analyzer()
+    else:
+        sent_dim_eff = 0
+
     # ----- parse reviews -----
     rev_rows: List[Tuple[str, str, float, int]] = []  # (uid,bid,stars,year)
     rev_embs: List[np.ndarray] = []
+    rev_sents: List[np.ndarray] = []
 
     with fp_rev.open("r", encoding="utf-8") as fh:
         for i, line in enumerate(fh):
@@ -128,6 +166,13 @@ def load_yelp_as_hetero(
                 emb = _mean_w2v(_simple_tokenize(txt), w2v, w2v_dim_eff)  # [300]
                 rev_embs.append(emb)
 
+            if use_text_edge_attr:
+                emb = _mean_w2v(_simple_tokenize(txt), w2v, w2v_dim_eff)
+                rev_embs.append(emb)
+
+            if use_sentiment_edge_attr:
+                rev_sents.append(_vader_scores(txt, mode=sentiment_mode, analyser=an))
+
     if not rev_rows:
         raise RuntimeError("No reviews loaded. Increase max_reviews or lower min_review_len.")
 
@@ -151,17 +196,24 @@ def load_yelp_as_hetero(
                 biz_rc_json[bid] = int(j.get("review_count", 0) or 0)
 
 
-    # ----- keep only overlapping reviews (and align embeddings) -----
-    if use_text_edge_attr:
-        kept = [
-            (u, b, s, y, e)
-            for (u, b, s, y), e in zip(rev_rows, rev_embs)
-            if (u in user_ids and b in biz_ids)
-        ]
-        if not kept:
+    if use_text_edge_attr or use_sentiment_edge_attr:
+        feats = []
+        # build tuples (row, maybe_w2v, maybe_sent)
+        for k, row in enumerate(rev_rows):
+            u, b, s, y = row
+            if (u in user_ids and b in biz_ids):
+                w = rev_embs[k] if use_text_edge_attr else None
+                se = rev_sents[k] if use_sentiment_edge_attr else None
+                feats.append((row, w, se))
+
+        if not feats:
             raise RuntimeError("No overlapping user/business ids with reviews.")
-        rev_rows = [(u, b, s, y) for (u, b, s, y, _) in kept]
-        rev_embs = [e for (*_, e) in kept]
+
+        rev_rows = [r for (r, _, _) in feats]
+        if use_text_edge_attr:
+            rev_embs = [w for (_, w, _) in feats]  # type: ignore
+        if use_sentiment_edge_attr:
+            rev_sents = [se for (_, _, se) in feats]  # type: ignore
     else:
         rev_rows = [(u, b, s, y) for (u, b, s, y) in rev_rows if (u in user_ids and b in biz_ids)]
         if not rev_rows:
@@ -205,14 +257,6 @@ def load_yelp_as_hetero(
         biz_feat[j, 0] = np.log1p(rc_json)
         biz_feat[j, 1] = np.log1p(deg_biz_rev[j])
 
-    # (Optional) z-score each column independently (uncomment if you prefer normalized features)
-    # for c in range(user_feat.shape[1]):
-    #     mu, sigma = user_feat[:, c].mean(), user_feat[:, c].std() + 1e-6
-    #     user_feat[:, c] = (user_feat[:, c] - mu) / sigma
-    # for c in range(biz_feat.shape[1]):
-    #     mu, sigma = biz_feat[:, c].mean(), biz_feat[:, c].std() + 1e-6
-    #     biz_feat[:, c] = (biz_feat[:, c] - mu) / sigma
-
     data[USER].x = torch.tensor(user_feat, dtype=torch.float32)
     data[BUS].x  = torch.tensor(biz_feat,  dtype=torch.float32)
 
@@ -221,17 +265,28 @@ def load_yelp_as_hetero(
     data[REL].edge_label = torch.tensor(stars, dtype=torch.long)   # stars as integer labels
     data[REL].time       = torch.tensor(years, dtype=torch.long).view(-1)
 
-    # ---- edge_attr = [W2V_300 || time_zscore_1] ----
+    # ---- edge_attr = [W2V || SENT || time_zscore] ----
     time_f = data[REL].time.to(torch.float32).view(-1, 1)
-    time_f = (time_f - time_f.mean()) / (time_f.std() + 1e-6)       # [E,1]
+    time_f = (time_f - time_f.mean()) / (time_f.std() + 1e-6)  # [E,1]
+
+    parts = []
+
     if use_text_edge_attr:
         w2v_mat = torch.tensor(np.stack(rev_embs, axis=0), dtype=torch.float32)  # [E,300]
         w = w2v_mat / (w2v_mat.norm(p=2, dim=-1, keepdim=True) + 1e-6)
-        data[REL].edge_attr = torch.cat([w, time_f], dim=-1)               # [E,301]
-        edge_attr_dim = w2v_dim_eff + 1
-    else:
-        data[REL].edge_attr = time_f                                             # [E,1]
-        edge_attr_dim = 1
+        parts.append(w)
+
+    if use_sentiment_edge_attr:
+        s_mat = torch.tensor(np.stack(rev_sents, axis=0), dtype=torch.float32)   # [E,sent_dim]
+        if zscore_sentiment:
+            s_mat = (s_mat - s_mat.mean(dim=0, keepdim=True)) / (s_mat.std(dim=0, keepdim=True) + 1e-6)
+        parts.append(s_mat)
+
+    parts.append(time_f)
+
+    data[REL].edge_attr = torch.cat(parts, dim=-1)
+    edge_attr_dim = int(data[REL].edge_attr.size(-1))  # final width
+
 
     # ----- friends (raw, directed for now) -----
     if include_user_friends:
@@ -259,7 +314,7 @@ def load_yelp_as_hetero(
         data[FRIENDS].edge_index = ei
         Ef = ei.size(1)
         # optional simple attrs if you want to use a conv that needs them later:
-        data[FRIENDS].edge_attr = torch.zeros(Ef, 301, dtype=torch.float32) # Needs to be same size as REL edges
+        data[FRIENDS].edge_attr = torch.zeros(Ef, edge_attr_dim, dtype=torch.float32)
         # dummy time earlier than any review year:
         min_year = int(data[REL].time.min().item()) if data[REL].time.numel() > 0 else 0
         data[FRIENDS].time = torch.full((Ef,), min_year - 1, dtype=torch.long)

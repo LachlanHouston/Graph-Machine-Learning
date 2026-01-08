@@ -8,10 +8,10 @@ import torch.nn.functional as F
 from warnings import filterwarnings
 from tqdm import tqdm
 from torch_geometric.loader import LinkNeighborLoader
-
+from sklearn.metrics import f1_score
 
 from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year, check_uniform_edge_attr_dim
-from graph_ml.model_HEAT import HeteroHEATStarPredictor
+from graph_ml.model import HeteroHGTStarPredictor
 from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits, log_confmatrix
 
 try:
@@ -21,6 +21,24 @@ except ImportError:
 
 filterwarnings("ignore")
 use_amp = False
+
+class FocalLoss(torch.nn.Module):
+    """Implementation of the Focal loss function
+
+        Args:
+            weight: class weight vector to be used in case of class imbalance
+            gamma: hyper-parameter for the focal loss scaling.
+    """
+    def __init__(self, weight=None, gamma=2):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = weight #weight parameter will act as the alpha parameter to balance class weights
+
+    def forward(self, outputs, targets):
+        ce_loss = torch.nn.functional.cross_entropy(outputs, targets, reduction='none', weight=self.weight) 
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1-pt)**self.gamma * ce_loss).mean() # mean over the batch
+        return focal_loss
 
 def ordinal_targets(y):
     B = y.size(0)
@@ -60,6 +78,9 @@ def main(cfg: DictConfig):
         data, rel=rel, boundary_year=2017, include_boundary_in_train=True
     )
 
+    train_edge_attr = data[rel].edge_attr[train_idx]  # shape [P_train, 305]
+    val_edge_attr   = data[rel].edge_attr[val_idx]    # shape [P_val, 305]
+
     # Seed edge pairs (positives only)
     train_pos = data[rel].edge_index[:, train_idx]
     val_pos   = data[rel].edge_index[:, val_idx]
@@ -94,8 +115,8 @@ def main(cfg: DictConfig):
     train_loader = LinkNeighborLoader(
         **common_kwargs,
         edge_label_index=(rel, train_pos),
-        edge_label=train_stars,       # stars ∈ {1..5}
-        edge_label_time=train_years,  # per-seed times
+        edge_label=train_stars,
+        edge_label_time=train_years,
     )
 
     val_loader = LinkNeighborLoader(
@@ -105,14 +126,16 @@ def main(cfg: DictConfig):
         edge_label_time=val_years,
     )
 
-    model = HeteroHEATStarPredictor(
+    model = HeteroHGTStarPredictor(
         metadata=data.metadata(),
         node_feat_dim=data['user'].x.size(1),
         hidden_dim=cfg.model.n_hid,
         num_layers=cfg.model.n_layers,
         num_heads=cfg.model.n_heads,
         dropout=cfg.model.dropout,
+        num_classes=5,
         edge_attr_dim=edge_attr_dim,
+        time_out=16,
     ).to(device)
 
     print('Number of Parameters for Total model:', get_n_params(model))
@@ -136,10 +159,7 @@ def main(cfg: DictConfig):
             )
             wandb.watch(model, log="gradients")
 
-    y_train_all = data[rel].edge_label[train_idx].to(torch.long)
-    with torch.no_grad():
-        pos = torch.stack([(y_train_all > k).float().mean() for k in range(1, 5)])
-    pos_w = ((1 - pos) / (pos + 1e-6)).to(device)
+    loss_fn = FocalLoss()
 
     best_val = float("inf")
     train_step = 0
@@ -155,22 +175,25 @@ def main(cfg: DictConfig):
         batch_bar = tqdm(train_loader, desc="Train batches", leave=False)
         for batch in batch_bar:
             batch = batch.to(device)
-            y_train = batch[rel].edge_label.float()
+            y_train = batch[rel].edge_label.to(torch.long)
+            y_train = (y_train - 1).clamp_(0, 4)
             optimizer.zero_grad(set_to_none=True)
 
             out = model(
+                batch.x_dict,
+                batch.edge_index_dict,
                 edge_label_index=batch[rel].edge_label_index,
                 label_edge_type=rel,
-                batch=batch,
+                edge_label_attr=train_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
+                edge_label_time=getattr(batch[rel], "edge_label_time", None),
             )
 
-            t = ordinal_targets(y_train)
-            loss = F.binary_cross_entropy_with_logits(out, t, pos_weight=pos_w)
+            loss = loss_fn(out, y_train)
 
-            probs = torch.sigmoid(out)
-            preds = 1 + (probs > 0.5).sum(dim=1)
+            pred_cls = out.argmax(dim=1)
+            preds = 1 + pred_cls
 
-            y_true_stars.append(y_train)
+            y_true_stars.append(y_train + 1)
             y_pred_stars.append(preds)
 
             loss.backward()
@@ -188,11 +211,8 @@ def main(cfg: DictConfig):
         batch_bar.close()
         avg_loss = total_loss / max(1, len(train_loader))
 
-        # compute train_acc over *all* batches this epoch
-        y_true = torch.cat(y_true_stars).float()
-        y_pred = torch.cat(y_pred_stars).float()
-        y_true_i = y_true.clamp(1, 5).round().int().cpu()
-        y_pred_i = y_pred.clamp(1, 5).round().int().cpu()
+        y_true_i = torch.cat(y_true_stars).int()
+        y_pred_i = torch.cat(y_pred_stars).int()
         train_acc = (y_true_i == y_pred_i).float().mean().item()
 
         epoch_bar.set_postfix({'train_acc': f'{train_acc:.4f}'})
@@ -209,24 +229,31 @@ def main(cfg: DictConfig):
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc="Val", leave=False, dynamic_ncols=True):
                 batch = batch.to(device, non_blocking=True)
-                y = batch[rel].edge_label.float()
+                y = batch[rel].edge_label.to(torch.long)
+                y = (y - 1).clamp_(0, 4)
+
                 out = model(
+                    batch.x_dict,
+                    batch.edge_index_dict,
                     edge_label_index=batch[rel].edge_label_index,
                     label_edge_type=rel,
-                    batch=batch,
+                    edge_label_attr=val_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
+                    edge_label_time=getattr(batch[rel], "edge_label_time", None),
                 )
 
-                t = ordinal_targets(y)
-                val_loss_sum += F.binary_cross_entropy_with_logits(out, t, pos_weight=pos_w).item()
+                val_loss_sum += loss_fn(out, y).item()
 
-                probs = torch.sigmoid(out)
-                preds = 1 + (probs > 0.5).sum(dim=1)
+                pred_cls = out.argmax(dim=1)
+                preds = 1 + pred_cls
+
                 se_sum += ((preds - y)**2).sum().item()
                 n_sum += y.numel()
-                y_true_stars.append(y)
+                y_true_stars.append(y + 1)
                 y_pred_stars.append(preds)
 
-                val_logits_list.append(out.detach().cpu())
+                val_logits_list.append(ordinal_targets(preds).detach().cpu())
+
+                t = ordinal_targets(y)
                 val_targets_list.append(t.detach().cpu())
 
         val_loss = val_loss_sum / max(1, len(val_loader))
@@ -241,20 +268,8 @@ def main(cfg: DictConfig):
         if run is not None and (epoch % cfg.wandb.conf_matrix == 0):
             log_confmatrix(run, y_true_i, y_pred_i, step=train_step, normalize=None, title="Val Confusion Matrix")
 
-        val_logits = torch.cat(val_logits_list, dim=0)
-        val_targets = torch.cat(val_targets_list, dim=0)
-        f1_micro = multilabel_f1_from_logits(
-            logits=val_logits,
-            targets=val_targets,
-            threshold=0.5,
-            average="micro",
-        )
-        f1_macro = multilabel_f1_from_logits(
-            logits=val_logits,
-            targets=val_targets,
-            threshold=0.5,
-            average="macro",
-        )
+        f1_macro = f1_score(y_true_i.numpy(), y_pred_i.numpy(), average="macro")
+        f1_micro = f1_score(y_true_i.numpy(), y_pred_i.numpy(), average="micro")
 
         if run is not None:
             wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'train/acc': train_acc, 'val/loss': val_loss, 'val/rmse': val_rmse, 'val_acc': val_acc,
@@ -268,9 +283,6 @@ def main(cfg: DictConfig):
 
         epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}', 'val_acc': f'{val_acc:.4f}',
                                'f1_micro': f'{f1_micro:.4f}', 'f1_macro': f'{f1_macro:.4f}'})
-        
-        print(y_true_i.tolist()[:20])
-        print(y_pred_i.tolist()[:20])
 
     if run is not None:
         run.finish()

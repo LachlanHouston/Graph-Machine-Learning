@@ -164,7 +164,7 @@ class HeteroHEATStarPredictor(nn.Module):
 
         # Edge prediction head: [h_src || h_dst] -> 4 logits (ordinal)
         pred_in = 2 * hidden_dim
-        pred_out = 4
+        pred_out = 5
         self.edge_pred = nn.Sequential(
             nn.Linear(pred_in, hidden_dim),
             nn.GELU(),

@@ -4,6 +4,7 @@ import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from texttable import Texttable
+import wandb
 
 def get_n_params(model):
     pp=0
