@@ -54,6 +54,7 @@ class HeteroHGTStarPredictor(nn.Module):
         num_classes: int = 5,
         edge_attr_dim: int = 0,      # optional: if you want edge_attr in the final linear layer
         time_out: int = 16,          # optional: if you want edge_label_time in the final linear layer
+        edge_embed_dim: int = 128,
         max_time_len: int = 240,
         base_time: Optional[int] = None,
         use_edge_attr_in_head: bool = True,
@@ -71,6 +72,7 @@ class HeteroHGTStarPredictor(nn.Module):
         self.time_out = int(time_out or 0)
         self.max_time_len = int(max_time_len)
         self.base_time = base_time
+        self.edge_emb_dim = int(edge_embed_dim)
 
         self.use_edge_attr_in_head = bool(use_edge_attr_in_head) and (self.edge_attr_dim > 0)
         self.use_time_in_head = bool(use_time_in_head) and (self.time_out > 0)
@@ -95,15 +97,24 @@ class HeteroHGTStarPredictor(nn.Module):
             for _ in range(num_layers)
         ])
 
+        # Edge attribute boosting
+        self.edge_in_dim = (self.edge_attr_dim if self.use_edge_attr_in_head else 0) + \
+                           (self.time_out if self.use_time_in_head else 0)
+        
+        self.edge_repr = nn.Identity() if edge_attr_dim == 0 else nn.Sequential(
+            nn.LayerNorm(self.edge_in_dim),
+            nn.Linear(self.edge_in_dim, self.edge_emb_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.edge_emb_dim, self.edge_emb_dim),
+        )
+
+        self.edge_gain = nn.Parameter(torch.Tensor(1, self.edge_emb_dim))
+
         self.do = nn.Dropout(self.dropout)
 
         # Single linear layer (your requirement #3)
-        head_in = 2 * self.hidden_dim
-        if self.use_edge_attr_in_head:
-            head_in += self.edge_attr_dim
-        if self.use_time_in_head:
-            head_in += self.time_out
-
+        head_in = 2 * self.hidden_dim + (self.edge_emb_dim if self.edge_in_dim > 0 else 0)
         self.classifier = nn.Linear(head_in, num_classes)
 
     def _time_to_index(self, t_raw: Tensor) -> Tensor:
@@ -156,7 +167,6 @@ class HeteroHGTStarPredictor(nn.Module):
                     device=h_src.device,
                     dtype=torch.float32,
                 )
-            parts.append(edge_label_attr.float())
 
         # 5) Optional supervised time in head
         if self.use_time_in_head:
@@ -165,7 +175,13 @@ class HeteroHGTStarPredictor(nn.Module):
 
             t_idx = self._time_to_index(edge_label_time)
             t_feat = self.time_enc(t_idx)
-            parts.append(t_feat)
+
+        # Edge attribute boosting
+        e = torch.cat([edge_label_attr, t_feat] if self.edge_in_dim > 0 else [], dim=-1)  # [M, D']
+        e = self.edge_repr(e) if e.numel() > 0 else e  # [M, edge_emb_dim] or []
+        e = e * self.edge_gain          # [M, edge_emb_dim] or []
+        if e.numel() > 0:
+            parts.append(e)
 
         z = torch.cat(parts, dim=-1)     # [M, head_in]
         return self.classifier(z)        # [M, num_classes]

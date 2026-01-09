@@ -81,6 +81,9 @@ def main(cfg: DictConfig):
     train_edge_attr = data[rel].edge_attr[train_idx]  # shape [P_train, 305]
     val_edge_attr   = data[rel].edge_attr[val_idx]    # shape [P_val, 305]
 
+    train_edge_attr = train_edge_attr.to(device)
+    val_edge_attr   = val_edge_attr.to(device)
+
     # Seed edge pairs (positives only)
     train_pos = data[rel].edge_index[:, train_idx]
     val_pos   = data[rel].edge_index[:, val_idx]
@@ -135,6 +138,7 @@ def main(cfg: DictConfig):
         dropout=cfg.model.dropout,
         num_classes=5,
         edge_attr_dim=edge_attr_dim,
+        edge_embed_dim=cfg.model.edge_embed_dim,
         time_out=16,
     ).to(device)
 
