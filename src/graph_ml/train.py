@@ -23,7 +23,8 @@ filterwarnings("ignore")
 use_amp = False
 
 class FocalLoss(torch.nn.Module):
-    """Implementation of the Focal loss function
+    """
+    Implementation of the Focal loss function
 
         Args:
             weight: class weight vector to be used in case of class imbalance
@@ -78,11 +79,7 @@ def main(cfg: DictConfig):
         data, rel=rel, boundary_year=2017, include_boundary_in_train=True
     )
 
-    train_edge_attr = data[rel].edge_attr[train_idx]  # shape [P_train, 305]
-    val_edge_attr   = data[rel].edge_attr[val_idx]    # shape [P_val, 305]
-
-    train_edge_attr = train_edge_attr.to(device)
-    val_edge_attr   = val_edge_attr.to(device)
+    full_edge_attr = data[rel].edge_attr.to(device)
 
     # Seed edge pairs (positives only)
     train_pos = data[rel].edge_index[:, train_idx]
@@ -149,6 +146,23 @@ def main(cfg: DictConfig):
         eps=1e-8
     )
 
+    optimizer = torch.optim.AdamW(
+        params=model.parameters(),
+        lr=cfg.train.lr,
+        eps=1e-8
+    )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",          # we minimize val_rmse
+        factor=0.5,
+        patience=2,
+        threshold=1e-3,
+        threshold_mode="rel",
+        cooldown=0,
+        min_lr=cfg.train.lr_scheduler_min,
+    )
+
     run = None
     if cfg.wandb.enabled:
         if wandb is None:
@@ -163,7 +177,13 @@ def main(cfg: DictConfig):
             )
             wandb.watch(model, log="gradients")
 
-    loss_fn = FocalLoss()
+    # Class weights from training split to address imbalance
+    train_labels = (train_stars - 1).clamp_(0, 4)
+    class_counts = torch.bincount(train_labels, minlength=5).float()
+    class_counts = class_counts.clamp(min=1.0)
+    class_weights = (class_counts.sum() / (class_counts.numel() * class_counts)).to(device)
+
+    loss_fn = FocalLoss(weight=class_weights)
 
     best_val = float("inf")
     train_step = 0
@@ -188,7 +208,7 @@ def main(cfg: DictConfig):
                 batch.edge_index_dict,
                 edge_label_index=batch[rel].edge_label_index,
                 label_edge_type=rel,
-                edge_label_attr=train_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
+                edge_label_attr=full_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
                 edge_label_time=getattr(batch[rel], "edge_label_time", None),
             )
 
@@ -241,7 +261,7 @@ def main(cfg: DictConfig):
                     batch.edge_index_dict,
                     edge_label_index=batch[rel].edge_label_index,
                     label_edge_type=rel,
-                    edge_label_attr=val_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
+                edge_label_attr=full_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
                     edge_label_time=getattr(batch[rel], "edge_label_time", None),
                 )
 
@@ -250,7 +270,7 @@ def main(cfg: DictConfig):
                 pred_cls = out.argmax(dim=1)
                 preds = 1 + pred_cls
 
-                se_sum += ((preds - y)**2).sum().item()
+                se_sum += ((pred_cls - y)**2).sum().item()
                 n_sum += y.numel()
                 y_true_stars.append(y + 1)
                 y_pred_stars.append(preds)
@@ -262,6 +282,9 @@ def main(cfg: DictConfig):
 
         val_loss = val_loss_sum / max(1, len(val_loader))
         val_rmse = (se_sum / max(1, n_sum)) ** 0.5
+
+        scheduler.step(val_rmse)
+        current_lr = optimizer.param_groups[0]["lr"]
 
         y_true = torch.cat(y_true_stars).float()
         y_pred = torch.cat(y_pred_stars).float()
@@ -276,8 +299,17 @@ def main(cfg: DictConfig):
         f1_micro = f1_score(y_true_i.numpy(), y_pred_i.numpy(), average="micro")
 
         if run is not None:
-            wandb.log({'epoch': epoch, 'train/loss': avg_loss, 'train/acc': train_acc, 'val/loss': val_loss, 'val/rmse': val_rmse, 'val_acc': val_acc,
-                       'val/f1_micro': f1_micro, 'val/f1_macro': f1_macro}, step=train_step)
+            wandb.log({
+                'epoch': epoch,
+                'lr': current_lr,
+                'train/loss': avg_loss,
+                'train/acc': train_acc,
+                'val/loss': val_loss,
+                'val/rmse': val_rmse,
+                'val_acc': val_acc,
+                'val/f1_micro': f1_micro,
+                'val/f1_macro': f1_macro,
+            }, step=train_step)
 
         if val_rmse < best_val:
             print(f'Saving new best model with val_acc: {val_acc:.4f} and val_rmse: {val_rmse:.4f}')
@@ -285,8 +317,15 @@ def main(cfg: DictConfig):
             os.makedirs(os.path.dirname(cfg.train.model_path), exist_ok=True)
             torch.save(model.state_dict(), cfg.train.model_path)
 
-        epoch_bar.set_postfix({'train_loss': f'{avg_loss:.4f}', 'val_loss': f'{val_loss:.4f}', 'val_rmse': f'{val_rmse:.4f}', 'val_acc': f'{val_acc:.4f}',
-                               'f1_micro': f'{f1_micro:.4f}', 'f1_macro': f'{f1_macro:.4f}'})
+        epoch_bar.set_postfix({
+            'train_loss': f'{avg_loss:.4f}',
+            'val_loss': f'{val_loss:.4f}',
+            'val_rmse': f'{val_rmse:.4f}',
+            'val_acc': f'{val_acc:.4f}',
+            'f1_micro': f'{f1_micro:.4f}',
+            'f1_macro': f'{f1_macro:.4f}',
+            'lr': f'{current_lr:.2e}',
+        })
 
     if run is not None:
         run.finish()

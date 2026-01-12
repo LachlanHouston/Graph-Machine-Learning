@@ -104,13 +104,30 @@ def load_yelp_as_hetero(
     set_seed(seed)
     data_dir = Path(data_dir)
 
-    # ----- cache: load if present -----
+    # ----- cache: load if present and compatible -----
     cache_path = data_dir / cache_subdir / "yelp_hetero.pt"
+    settings = {
+        "max_reviews": max_reviews,
+        "min_review_len": min_review_len,
+        "include_user_friends": include_user_friends,
+        "max_friends_per_user": max_friends_per_user,
+        "use_text_edge_attr": use_text_edge_attr,
+        "w2v_model_name": w2v_model_name,
+        "w2v_dim": w2v_dim,
+        "use_sentiment_edge_attr": use_sentiment_edge_attr,
+        "sentiment_mode": sentiment_mode,
+        "zscore_sentiment": zscore_sentiment,
+    }
     if cache and cache_path.exists():
         obj = torch.load(cache_path, map_location="cpu", weights_only=False)
-        data = obj["data"] if isinstance(obj, dict) and "data" in obj else obj
-        print(f"[cache] Loaded preprocessed graph: {cache_path}")
-        return data
+        if isinstance(obj, dict) and "data" in obj and "meta" in obj:
+            cached_settings = obj["meta"].get("settings")
+            if cached_settings == settings:
+                print(f"[cache] Loaded preprocessed graph: {cache_path}")
+                return obj["data"]
+            print(f"[cache] Settings changed; rebuilding cache: {cache_path}")
+        else:
+            print(f"[cache] Legacy cache format; rebuilding: {cache_path}")
 
     # ----- required files -----
     fp_rev  = data_dir / "yelp_academic_dataset_review.json"
@@ -161,10 +178,6 @@ def load_yelp_as_hetero(
                 year = -1
 
             rev_rows.append((uid, bid, stars, year))
-
-            if use_text_edge_attr:
-                emb = _mean_w2v(_simple_tokenize(txt), w2v, w2v_dim_eff)  # [300]
-                rev_embs.append(emb)
 
             if use_text_edge_attr:
                 emb = _mean_w2v(_simple_tokenize(txt), w2v, w2v_dim_eff)
@@ -332,6 +345,7 @@ def load_yelp_as_hetero(
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         meta = {
             "edge_attr_dim_reviews": int(edge_attr_dim),
+            "settings": settings,
             "raw_fps": {
                 "review": _file_fingerprint(fp_rev),
                 "user": _file_fingerprint(fp_user),

@@ -109,7 +109,7 @@ class HeteroHGTStarPredictor(nn.Module):
             nn.Linear(self.edge_emb_dim, self.edge_emb_dim),
         )
 
-        self.edge_gain = nn.Parameter(torch.Tensor(1, self.edge_emb_dim))
+        self.edge_gain = nn.Parameter(torch.tensor(1.0))
 
         self.do = nn.Dropout(self.dropout)
 
