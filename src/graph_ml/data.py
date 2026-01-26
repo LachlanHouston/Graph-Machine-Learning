@@ -1,66 +1,102 @@
 from __future__ import annotations
 
-import json, re
+import json
+import random
+import re
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple, Dict
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch import Tensor
 from torch_geometric.data import HeteroData
 import torch_geometric.transforms as T
-from torch_geometric.utils import negative_sampling
+from tqdm import tqdm
 
 from graph_ml.utils import set_seed
 
 USER = "user"
-BUS  = "business"
+BUS = "business"
 
-REL     = (USER, "reviews", BUS)
+REL = (USER, "reviews", BUS)
 FRIENDS = (USER, "friends", USER)
 
 _SENT = None
+_W2V = None
+_W2V_DIM_DEFAULT = 300
+_TOKEN_PAT = re.compile(r"[A-Za-z']+")
+
+
+def reservoir_sample_jsonl(
+    path: Path | str,
+    k: int,
+    *,
+    seed: int = 42,
+    max_lines: Optional[int] = None,
+    desc: str = "Reservoir sampling",
+) -> List[Dict[str, Any]]:
+    """
+    Unbiased reservoir sampling of k JSON objects from a JSONL file (one JSON per line).
+    One pass, O(k) memory. If max_lines is provided, sampling is unbiased within that prefix.
+    """
+    rng = random.Random(seed)
+    reservoir: List[Dict[str, Any]] = []
+
+    path = str(path)
+    with open(path, "r", encoding="utf-8") as fh:
+        it = tqdm(enumerate(fh), desc=desc, unit="lines", total=max_lines, dynamic_ncols=True)
+        for i, line in it:
+            if max_lines is not None and i >= max_lines:
+                break
+            line = line.strip()
+            if not line:
+                continue
+
+            obj = json.loads(line)
+
+            if len(reservoir) < k:
+                reservoir.append(obj)
+            else:
+                t = i + 1  # number seen so far
+                j = rng.randrange(t)
+                if j < k:
+                    reservoir[j] = obj
+
+            if (i % 50_000) == 0 and i > 0:
+                it.set_postfix(seen=i + 1, kept=len(reservoir))
+
+    return reservoir
+
 
 def _get_sentiment_analyzer():
-    """
-    Returns a VADER sentiment analyzer.
-    Prefers vaderSentiment package, falls back to nltk if available.
-    """
     global _SENT
     if _SENT is None:
         try:
             from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
             _SENT = SentimentIntensityAnalyzer()
         except Exception:
-            print("vaderSentiment not available")
             return None
     return _SENT
 
-def _vader_scores(text: str, *, mode: str = "vader4", analyser=None) -> np.ndarray:
-    """
-    mode:
-      - "vader4": [neg, neu, pos, compound]
-      - "compound": [compound]
-    """
+
+def _vader_scores(text: str, *, mode: str, analyser) -> np.ndarray:
     s = analyser.polarity_scores(text or "")
     if mode == "compound":
         return np.array([s["compound"]], dtype=np.float32)
     return np.array([s["neg"], s["neu"], s["pos"], s["compound"]], dtype=np.float32)
 
-# ---------- Word2Vec (lazy, cached) ----------
-_W2V = None
-_W2V_DIM_DEFAULT = 300
-_TOKEN_PAT = re.compile(r"[A-Za-z']+")
 
-def _get_w2v(model_name: str = "word2vec-google-news-300"):
+def _get_w2v(model_name: str):
     global _W2V
     if _W2V is None:
         import gensim.downloader as api
         _W2V = api.load(model_name)
     return _W2V
 
+
 def _simple_tokenize(s: str) -> List[str]:
-    return [t.lower() for t in _TOKEN_PAT.findall(s)]
+    return [t.lower() for t in _TOKEN_PAT.findall(s or "")]
+
 
 def _mean_w2v(tokens: Sequence[str], w2v, dim: int) -> np.ndarray:
     known = [t for t in tokens if t in w2v.key_to_index]
@@ -72,43 +108,60 @@ def _mean_w2v(tokens: Sequence[str], w2v, dim: int) -> np.ndarray:
     vec /= float(len(known))
     return vec
 
-# ---------- Utilities ----------
+
 def _file_fingerprint(p: Path) -> str:
     st = p.stat()
     return f"{st.st_size}-{st.st_mtime_ns}"
+
 
 def _parse_friends_field(s: Optional[str]) -> List[str]:
     if not s or s == "None":
         return []
     return [t.strip() for t in s.split(",") if t.strip()]
 
-# ---------- Main loader ----------
+
 def load_yelp_as_hetero(
     data_dir: Path | str,
     *,
-    max_reviews: Optional[int] = 100_000,
-    min_review_len: int = 5,
+    # Reviews
+    max_reviews: Optional[int] = 100_000,         # if None: stream all (no reservoir)
+    sample_method: str = "reservoir",             # "reservoir" or "prefix"
+    reservoir_max_lines: Optional[int] = None,    # optional cap on lines considered for reservoir/prefix
+    # Filtering (token-based)
+    min_review_len: int = 5,                      # MIN TOKENS (not chars)
+    coverage_threshold: float = 0.2,              # only used if use_text_edge_attr=True
+    # General
     seed: int = 42,
     cache: bool = True,
     cache_subdir: str = "processed",
+    # Friends
     include_user_friends: bool = True,
     max_friends_per_user: Optional[int] = 50,
+    # Edge attrs
     use_text_edge_attr: bool = True,
     w2v_model_name: str = "word2vec-google-news-300",
     w2v_dim: Optional[int] = None,
     use_sentiment_edge_attr: bool = True,
     sentiment_mode: str = "vader4",   # "vader4" or "compound"
-    zscore_sentiment: bool = False,   # optional normalization
+    zscore_sentiment: bool = False,
 ) -> HeteroData:
-
     set_seed(seed)
     data_dir = Path(data_dir)
 
-    # ----- cache: load if present and compatible -----
+    fp_rev = data_dir / "yelp_academic_dataset_review.json"
+    fp_user = data_dir / "yelp_academic_dataset_user.json"
+    fp_biz = data_dir / "yelp_academic_dataset_business.json"
+    for f in (fp_rev, fp_user, fp_biz):
+        if not f.exists():
+            raise FileNotFoundError(f"Missing file: {f}")
+
     cache_path = data_dir / cache_subdir / "yelp_hetero.pt"
     settings = {
         "max_reviews": max_reviews,
+        "sample_method": sample_method,
+        "reservoir_max_lines": reservoir_max_lines,
         "min_review_len": min_review_len,
+        "coverage_threshold": coverage_threshold,
         "include_user_friends": include_user_friends,
         "max_friends_per_user": max_friends_per_user,
         "use_text_edge_attr": use_text_edge_attr,
@@ -121,191 +174,222 @@ def load_yelp_as_hetero(
     if cache and cache_path.exists():
         obj = torch.load(cache_path, map_location="cpu", weights_only=False)
         if isinstance(obj, dict) and "data" in obj and "meta" in obj:
-            cached_settings = obj["meta"].get("settings")
-            if cached_settings == settings:
-                print(f"[cache] Loaded preprocessed graph: {cache_path}")
+            # Print stats from cached data
+            print("Cached data loaded.")
+            print(f"  - Settings: {obj['meta'].get('settings')}")
+            print(f"  - Data keys: {list(obj['data'].keys())}")
+            print(f"  - Stats: {obj['meta'].get('stats')}")
+            if obj["meta"].get("settings") == settings:
                 return obj["data"]
-            print(f"[cache] Settings changed; rebuilding cache: {cache_path}")
+
+    w2v = _get_w2v(w2v_model_name) if use_text_edge_attr else None
+    w2v_dim_eff = int(w2v_dim or _W2V_DIM_DEFAULT) if use_text_edge_attr else 0
+
+    analyser = _get_sentiment_analyzer() if use_sentiment_edge_attr else None
+    if use_sentiment_edge_attr and analyser is None:
+        raise RuntimeError("Sentiment requested but VADER sentiment analyzer is unavailable.")
+
+    # ---- load reviews (prefix or reservoir) ----
+    if max_reviews is None:
+        review_iter: List[Dict[str, Any]] | None = None  # stream
+    else:
+        if sample_method not in ("reservoir", "prefix"):
+            raise ValueError("sample_method must be 'reservoir' or 'prefix'")
+        if sample_method == "reservoir":
+            review_iter = reservoir_sample_jsonl(
+                fp_rev,
+                k=max_reviews,
+                seed=seed,
+                max_lines=reservoir_max_lines,
+                desc="Reservoir sampling reviews",
+            )
         else:
-            print(f"[cache] Legacy cache format; rebuilding: {cache_path}")
+            review_iter = []
+            with fp_rev.open("r", encoding="utf-8") as fh:
+                it = tqdm(enumerate(fh), desc="Reading review prefix", unit="lines",
+                          total=(reservoir_max_lines or max_reviews), dynamic_ncols=True)
+                for i, line in it:
+                    if reservoir_max_lines is not None and i >= reservoir_max_lines:
+                        break
+                    if i >= max_reviews:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    review_iter.append(json.loads(line))
 
-    # ----- required files -----
-    fp_rev  = data_dir / "yelp_academic_dataset_review.json"
-    fp_user = data_dir / "yelp_academic_dataset_user.json"
-    fp_biz  = data_dir / "yelp_academic_dataset_business.json"
-    for f in (fp_rev, fp_user, fp_biz):
-        if not f.exists():
-            raise FileNotFoundError(f"Missing file: {f}")
-
-    # ----- optional W2V -----
-    if use_text_edge_attr:
-        w2v = _get_w2v(w2v_model_name)
-        w2v_dim_eff = int(w2v_dim or _W2V_DIM_DEFAULT)  # 300
-    else:
-        w2v = None
-        w2v_dim_eff = 0
-
-    if use_sentiment_edge_attr:
-        sent_dim_eff = 4 if sentiment_mode == "vader4" else 1
-        an = _get_sentiment_analyzer()
-    else:
-        sent_dim_eff = 0
-
-    # ----- parse reviews -----
-    rev_rows: List[Tuple[str, str, float, int]] = []  # (uid,bid,stars,year)
+    # ---- parse reviews into edges + edge features ----
+    rev_rows: List[Tuple[str, str, float, int]] = []
     rev_embs: List[np.ndarray] = []
     rev_sents: List[np.ndarray] = []
 
-    with fp_rev.open("r", encoding="utf-8") as fh:
-        for i, line in enumerate(fh):
-            if max_reviews is not None and i >= max_reviews:
-                break
-            r = json.loads(line)
+    n_drop_len = 0
+    n_drop_cov = 0
 
-            txt = (r.get("text") or "")
-            if len(txt) < min_review_len:
-                continue
-            uid = r.get("user_id")
-            bid = r.get("business_id")
-            if not uid or not bid:
-                continue
+    def _handle_review(r: Dict[str, Any]):
+        nonlocal n_drop_len, n_drop_cov
+        txt = r.get("text") or ""
+        tokens = _simple_tokenize(txt)
 
-            stars = float(r.get("stars", 0.0))
-            date_str = r.get("date") or ""
-            try:
-                year = int(date_str[:4]) if len(date_str) >= 4 else -1
-            except Exception:
-                year = -1
+        if len(tokens) < min_review_len:
+            n_drop_len += 1
+            return
 
-            rev_rows.append((uid, bid, stars, year))
+        if use_text_edge_attr:
+            known = [t for t in tokens if t in w2v.key_to_index]  # type: ignore[union-attr]
+            coverage = len(known) / max(1, len(tokens))
+            if coverage < coverage_threshold:
+                n_drop_cov += 1
+                return
 
-            if use_text_edge_attr:
-                emb = _mean_w2v(_simple_tokenize(txt), w2v, w2v_dim_eff)
-                rev_embs.append(emb)
+        uid = r.get("user_id")
+        bid = r.get("business_id")
+        if not uid or not bid:
+            return
 
-            if use_sentiment_edge_attr:
-                rev_sents.append(_vader_scores(txt, mode=sentiment_mode, analyser=an))
+        stars = float(r.get("stars", 0.0))
+        date_str = r.get("date") or ""
+        year = int(date_str[:4]) if len(date_str) >= 4 and date_str[:4].isdigit() else -1
+
+        rev_rows.append((uid, bid, stars, year))
+
+        if use_text_edge_attr:
+            rev_embs.append(_mean_w2v(tokens, w2v, w2v_dim_eff))  # type: ignore[arg-type]
+        if use_sentiment_edge_attr:
+            rev_sents.append(_vader_scores(txt, mode=sentiment_mode, analyser=analyser))
+
+    if review_iter is None:
+        with fp_rev.open("r", encoding="utf-8") as fh:
+            it = tqdm(enumerate(fh), desc="Parsing reviews", unit="lines",
+                      total=reservoir_max_lines, dynamic_ncols=True)
+            for i, line in it:
+                if reservoir_max_lines is not None and i >= reservoir_max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                _handle_review(r)
+                if max_reviews is not None and len(rev_rows) >= max_reviews:
+                    break
+                if (i % 2000) == 0 and i > 0:
+                    it.set_postfix(kept=len(rev_rows), drop_len=n_drop_len, drop_cov=n_drop_cov)
+    else:
+        for r in tqdm(review_iter, desc="Parsing sampled reviews", unit="rev", dynamic_ncols=True):
+            _handle_review(r)
 
     if not rev_rows:
-        raise RuntimeError("No reviews loaded. Increase max_reviews or lower min_review_len.")
+        raise RuntimeError("No reviews loaded after filtering. Lower thresholds or increase max_reviews.")
 
-    # ----- collect valid ids + review_count from json -----
-    user_ids, biz_ids = set(), set()
-    user_rc_json: Dict[str, int] = {}   # user_id -> review_count from user.json
-    biz_rc_json:  Dict[str, int] = {}   # business_id -> review_count from business.json
+    # ---- load users/businesses sets + json review_count fields ----
+    user_ids: set[str] = set()
+    biz_ids: set[str] = set()
+    user_rc_json: Dict[str, int] = {}
+    biz_rc_json: Dict[str, int] = {}
 
     with fp_user.open("r", encoding="utf-8") as fh:
         for line in fh:
             j = json.loads(line)
-            if (uid := j.get("user_id")):
+            uid = j.get("user_id")
+            if uid:
                 user_ids.add(uid)
                 user_rc_json[uid] = int(j.get("review_count", 0) or 0)
 
     with fp_biz.open("r", encoding="utf-8") as fh:
         for line in fh:
             j = json.loads(line)
-            if (bid := j.get("business_id")):
+            bid = j.get("business_id")
+            if bid:
                 biz_ids.add(bid)
                 biz_rc_json[bid] = int(j.get("review_count", 0) or 0)
 
+    keep_mask = [(u in user_ids and b in biz_ids) for (u, b, _, _) in rev_rows]
+    if not any(keep_mask):
+        raise RuntimeError("No overlapping user/business ids with reviews.")
 
+    # filter aligned feature arrays consistently
     if use_text_edge_attr or use_sentiment_edge_attr:
-        feats = []
-        # build tuples (row, maybe_w2v, maybe_sent)
-        for k, row in enumerate(rev_rows):
-            u, b, s, y = row
-            if (u in user_ids and b in biz_ids):
-                w = rev_embs[k] if use_text_edge_attr else None
-                se = rev_sents[k] if use_sentiment_edge_attr else None
-                feats.append((row, w, se))
+        rev_rows_f: List[Tuple[str, str, float, int]] = []
+        rev_embs_f: List[np.ndarray] = [] if use_text_edge_attr else []
+        rev_sents_f: List[np.ndarray] = [] if use_sentiment_edge_attr else []
 
-        if not feats:
-            raise RuntimeError("No overlapping user/business ids with reviews.")
+        for k, keep in enumerate(keep_mask):
+            if not keep:
+                continue
+            rev_rows_f.append(rev_rows[k])
+            if use_text_edge_attr:
+                rev_embs_f.append(rev_embs[k])
+            if use_sentiment_edge_attr:
+                rev_sents_f.append(rev_sents[k])
 
-        rev_rows = [r for (r, _, _) in feats]
+        rev_rows = rev_rows_f
         if use_text_edge_attr:
-            rev_embs = [w for (_, w, _) in feats]  # type: ignore
+            rev_embs = rev_embs_f
         if use_sentiment_edge_attr:
-            rev_sents = [se for (_, _, se) in feats]  # type: ignore
+            rev_sents = rev_sents_f
     else:
-        rev_rows = [(u, b, s, y) for (u, b, s, y) in rev_rows if (u in user_ids and b in biz_ids)]
-        if not rev_rows:
-            raise RuntimeError("No overlapping user/business ids with reviews.")
+        rev_rows = [row for row, keep in zip(rev_rows, keep_mask) if keep]
 
-    # ----- index maps -----
     uniq_users = sorted({u for (u, _, _, _) in rev_rows})
-    uniq_biz   = sorted({b for (_, b, _, _) in rev_rows})
+    uniq_biz = sorted({b for (_, b, _, _) in rev_rows})
     u2i = {u: i for i, u in enumerate(uniq_users)}
     b2i = {b: i for i, b in enumerate(uniq_biz)}
 
-    # ----- edge tensors -----
     u_idx = np.fromiter((u2i[u] for (u, _, _, _) in rev_rows), dtype=np.int64)
     b_idx = np.fromiter((b2i[b] for (_, b, _, _) in rev_rows), dtype=np.int64)
     stars = np.fromiter((s for (*_, s, _) in rev_rows), dtype=np.float32)
     years = np.fromiter((y for (*_, y) in rev_rows), dtype=np.int16)
 
-    # ----- degrees in the (filtered) reviews bipartite graph -----
-    # Users: how many reviews they wrote in *this* processed set
-    deg_user_rev = np.bincount(u_idx, minlength=len(u2i)).astype(np.int64)          # [N_user]
-    # Businesses: how many reviews they received in *this* processed set
-    deg_biz_rev  = np.bincount(b_idx, minlength=len(b2i)).astype(np.int64)          # [N_biz]
+    deg_user_rev = np.bincount(u_idx, minlength=len(u2i)).astype(np.int64)
+    deg_biz_rev = np.bincount(b_idx, minlength=len(b2i)).astype(np.int64)
 
-    # ----- build heterodata -----
     data = HeteroData()
     data[USER].num_nodes = len(uniq_users)
-    data[BUS].num_nodes  = len(uniq_biz)
+    data[BUS].num_nodes = len(uniq_biz)
 
-    # ---------- node features ----------
-    # Users: [log1p(review_count_json), log1p(degree_in_reviews_graph)]
     user_feat = np.zeros((len(u2i), 2), dtype=np.float32)
     for uid, i in u2i.items():
-        rc_json = user_rc_json.get(uid, 0)
-        user_feat[i, 0] = np.log1p(rc_json)
+        user_feat[i, 0] = np.log1p(user_rc_json.get(uid, 0))
         user_feat[i, 1] = np.log1p(deg_user_rev[i])
 
-    # Businesses: [log1p(review_count_json), log1p(degree_in_reviews_graph)]
     biz_feat = np.zeros((len(b2i), 2), dtype=np.float32)
     for bid, j in b2i.items():
-        rc_json = biz_rc_json.get(bid, 0)
-        biz_feat[j, 0] = np.log1p(rc_json)
+        biz_feat[j, 0] = np.log1p(biz_rc_json.get(bid, 0))
         biz_feat[j, 1] = np.log1p(deg_biz_rev[j])
 
     data[USER].x = torch.tensor(user_feat, dtype=torch.float32)
-    data[BUS].x  = torch.tensor(biz_feat,  dtype=torch.float32)
+    data[BUS].x = torch.tensor(biz_feat, dtype=torch.float32)
 
-    edge_index = torch.tensor(np.vstack([u_idx, b_idx]), dtype=torch.long)
-    data[REL].edge_index = edge_index
-    data[REL].edge_label = torch.tensor(stars, dtype=torch.long)   # stars as integer labels
-    data[REL].time       = torch.tensor(years, dtype=torch.long).view(-1)
+    data[REL].edge_index = torch.tensor(np.vstack([u_idx, b_idx]), dtype=torch.long)
+    data[REL].edge_label = torch.tensor(stars, dtype=torch.long)
+    data[REL].time = torch.tensor(years, dtype=torch.long).view(-1)
 
-    # ---- edge_attr = [W2V || SENT || time_zscore] ----
+    # edge_attr = [W2V || SENT || time_zscore]
     time_f = data[REL].time.to(torch.float32).view(-1, 1)
-    time_f = (time_f - time_f.mean()) / (time_f.std() + 1e-6)  # [E,1]
+    time_f = (time_f - time_f.mean()) / (time_f.std() + 1e-6)
 
-    parts = []
+    parts: List[torch.Tensor] = []
 
     if use_text_edge_attr:
-        w2v_mat = torch.tensor(np.stack(rev_embs, axis=0), dtype=torch.float32)  # [E,300]
-        w = w2v_mat / (w2v_mat.norm(p=2, dim=-1, keepdim=True) + 1e-6)
-        parts.append(w)
+        w2v_mat = torch.tensor(np.stack(rev_embs, axis=0), dtype=torch.float32)
+        w2v_mat = w2v_mat / (w2v_mat.norm(p=2, dim=-1, keepdim=True) + 1e-6)
+        parts.append(w2v_mat)
 
     if use_sentiment_edge_attr:
-        s_mat = torch.tensor(np.stack(rev_sents, axis=0), dtype=torch.float32)   # [E,sent_dim]
+        s_mat = torch.tensor(np.stack(rev_sents, axis=0), dtype=torch.float32)
         if zscore_sentiment:
             s_mat = (s_mat - s_mat.mean(dim=0, keepdim=True)) / (s_mat.std(dim=0, keepdim=True) + 1e-6)
         parts.append(s_mat)
 
     parts.append(time_f)
-
     data[REL].edge_attr = torch.cat(parts, dim=-1)
-    edge_attr_dim = int(data[REL].edge_attr.size(-1))  # final width
+    reviews_edge_attr_dim = int(data[REL].edge_attr.size(-1))
 
-
-    # ----- friends (raw, directed for now) -----
     if include_user_friends:
         friend_pairs: List[Tuple[int, int]] = []
         with fp_user.open("r", encoding="utf-8") as fh:
-            for line in fh:
+            it = tqdm(fh, desc="Parsing friends", unit="lines", dynamic_ncols=True)
+            for line in it:
                 j = json.loads(line)
                 uid = j.get("user_id")
                 if uid not in u2i:
@@ -320,31 +404,26 @@ def load_yelp_as_hetero(
                         friend_pairs.append((u_local, v))
 
         if friend_pairs:
-            ei = torch.tensor(friend_pairs, dtype=torch.long).t().contiguous()   # [2, E_f_raw]
+            ei = torch.tensor(friend_pairs, dtype=torch.long).t().contiguous()
         else:
             ei = torch.empty((2, 0), dtype=torch.long)
 
         data[FRIENDS].edge_index = ei
-        Ef = ei.size(1)
-        # optional simple attrs if you want to use a conv that needs them later:
-        data[FRIENDS].edge_attr = torch.zeros(Ef, edge_attr_dim, dtype=torch.float32)
-        # dummy time earlier than any review year:
+        ef = ei.size(1)
+        data[FRIENDS].edge_attr = torch.zeros(ef, reviews_edge_attr_dim, dtype=torch.float32)
         min_year = int(data[REL].time.min().item()) if data[REL].time.numel() > 0 else 0
-        data[FRIENDS].time = torch.full((Ef,), min_year - 1, dtype=torch.long)
+        data[FRIENDS].time = torch.full((ef,), min_year - 1, dtype=torch.long)
 
-    # ----- make the entire hetero graph undirected -----
     data = T.ToUndirected(reduce="add", merge=True)(data)
 
-    # shape hygiene: ensure times are 1-D
     for et in data.edge_types:
         if "time" in data[et]:
             data[et].time = data[et].time.view(-1)
 
-    # ----- cache: save -----
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         meta = {
-            "edge_attr_dim_reviews": int(edge_attr_dim),
+            "edge_attr_dim_reviews": int(reviews_edge_attr_dim),
             "settings": settings,
             "raw_fps": {
                 "review": _file_fingerprint(fp_rev),
@@ -355,14 +434,15 @@ def load_yelp_as_hetero(
                 "n_users": int(data[USER].num_nodes),
                 "n_businesses": int(data[BUS].num_nodes),
                 "n_edges_per_type": {str(et): int(data[et].edge_index.size(1)) for et in data.edge_types},
+                "dropped_min_tokens": int(n_drop_len),
+                "dropped_low_coverage": int(n_drop_cov),
             },
         }
         torch.save({"data": data, "meta": meta}, cache_path)
-        print(f"[cache] Saved preprocessed graph: {cache_path}")
 
     return data
 
-# ---------- Splits ----------
+
 def split_edge_indices(
     num_edges: int,
     val_ratio: float = 0.1,
@@ -375,32 +455,36 @@ def split_edge_indices(
     n_test = int(test_ratio * num_edges)
     n_val = int(val_ratio * num_edges)
     test_idx = torch.as_tensor(idx[:n_test], dtype=torch.long)
-    val_idx = torch.as_tensor(idx[n_test:n_test + n_val], dtype=torch.long)
-    train_idx = torch.as_tensor(idx[n_test + n_val:], dtype=torch.long)
+    val_idx = torch.as_tensor(idx[n_test : n_test + n_val], dtype=torch.long)
+    train_idx = torch.as_tensor(idx[n_test + n_val :], dtype=torch.long)
     return train_idx, val_idx, test_idx
 
-def check_uniform_edge_attr_dim(data: HeteroData, rel_a, rel_b, expect_dim: Optional[int] = None):
-    """
-    Ensure all relations used by the model expose the same edge_attr width.
-    This is required for HEATConv (single edge_dim across edge types).
-    """
+
+def check_uniform_edge_attr_dim(
+    data: HeteroData,
+    rel_a: Tuple[str, str, str],
+    rel_b: Tuple[str, str, str],
+    expect_dim: Optional[int] = None,
+) -> int:
     dims: Dict[Tuple[str, str, str], int] = {}
     for et in (rel_a, rel_b):
-        if hasattr(data[et], "edge_attr") and data[et].edge_attr is not None:
-            dims[et] = int(data[et].edge_attr.size(-1))
-        else:
-            dims[et] = 0
-    # If friends had no attrs, create a red flag (HEATConv expects a uniform width).
+        ea = getattr(data[et], "edge_attr", None)
+        dims[et] = int(ea.size(-1)) if ea is not None else 0
+
     if dims[rel_b] == 0 and dims[rel_a] > 0:
         raise RuntimeError(
             f"{rel_b} has no edge_attr but {rel_a} has dim={dims[rel_a]}. "
-            f"Provide zero edge_attr of the same width for {rel_b} (e.g., torch.zeros(E_f, {dims[rel_a]}))."
+            f"Provide zero edge_attr of the same width for {rel_b}."
         )
+
     if expect_dim is not None and dims[rel_a] != expect_dim:
         raise RuntimeError(f"{rel_a} edge_attr dim mismatch: got {dims[rel_a]} vs expect {expect_dim}")
+
     if dims[rel_a] != dims[rel_b]:
-        raise RuntimeError(f"edge_attr dims differ across relations: {rel_a}->{dims[rel_a]}, {rel_b}->{dims[rel_b]}")
+        raise RuntimeError(f"edge_attr dims differ: {rel_a}->{dims[rel_a]}, {rel_b}->{dims[rel_b]}")
+
     return dims[rel_a]
+
 
 def split_edge_indices_by_year(
     data: HeteroData,
@@ -410,11 +494,8 @@ def split_edge_indices_by_year(
     shuffle_within_splits: bool = False,
     seed: int = 42,
 ) -> Tuple[Tensor, Tensor]:
-    """
-    Temporal split of review edges by `data[rel].time` (1-D int tensor of years).
-    Returns train_idx, val_idx (indices into data[rel].edge_index).
-    """
     years = data[rel].time.view(-1)
+
     if include_boundary_in_train:
         train_mask = years <= boundary_year
         val_mask = years > boundary_year
@@ -432,8 +513,8 @@ def split_edge_indices_by_year(
 
     if train_idx.numel() == 0 or val_idx.numel() == 0:
         raise RuntimeError(
-            f"Temporal split produced empty set(s): "
-            f"train={train_idx.numel()}, val={val_idx.numel()}. "
+            f"Temporal split produced empty set(s): train={train_idx.numel()}, val={val_idx.numel()}, "
             f"boundary_year={boundary_year}, years(min={int(years.min())}, max={int(years.max())})."
         )
+
     return train_idx, val_idx

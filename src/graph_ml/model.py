@@ -14,7 +14,7 @@ REL = ("user", "reviews", "business")
 class RelTemporalEncoding(nn.Module):
     def __init__(self, n_hid: int, max_len: int = 240, dropout: float = 0.0):
         super().__init__()
-        position = torch.arange(0., max_len).unsqueeze(1)  # [max_len, 1]
+        position = torch.arange(0., max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, n_hid, 2) * -(math.log(10000.0) / n_hid))
 
         emb = nn.Embedding(max_len, n_hid)
@@ -47,13 +47,15 @@ class HeteroHGTStarPredictor(nn.Module):
         self,
         metadata,
         node_feat_dim: int,
+        num_users: int, 
+        num_businesses: int,
         hidden_dim: int = 256,
         num_layers: int = 3,
         num_heads: int = 4,
         dropout: float = 0.1,
         num_classes: int = 5,
-        edge_attr_dim: int = 0,      # optional: if you want edge_attr in the final linear layer
-        time_out: int = 16,          # optional: if you want edge_label_time in the final linear layer
+        edge_attr_dim: int = 0,
+        time_out: int = 16,
         edge_embed_dim: int = 128,
         max_time_len: int = 240,
         base_time: Optional[int] = None,
@@ -129,8 +131,8 @@ class HeteroHGTStarPredictor(nn.Module):
         *,
         edge_label_index: Tensor,
         label_edge_type: Tuple[str, str, str] = REL,
-        edge_label_attr: Optional[Tensor] = None,     # [M, edge_attr_dim] for supervised edges only
-        edge_label_time: Optional[Tensor] = None,     # [M] for supervised edges only
+        edge_label_attr: Optional[Tensor] = None,
+        edge_label_time: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Pure PyG style:
@@ -140,7 +142,7 @@ class HeteroHGTStarPredictor(nn.Module):
             edge_label_attr: edge_attr for the supervised edges only (shape [M, D])
             edge_label_time: time for the supervised edges only (shape [M])
         Returns:
-        logits [M, num_classes]
+            logits [M, num_classes]
         """
         # 1) Project nodes
         x_dict = {nt: self.node_in[nt](x.float()) for nt, x in x_dict.items()}
@@ -161,7 +163,6 @@ class HeteroHGTStarPredictor(nn.Module):
         # 4) Optional supervised edge_attr in head
         if self.use_edge_attr_in_head:
             if edge_label_attr is None:
-                # keep shapes consistent; but note: edge_attr won't influence output in this case
                 edge_label_attr = torch.zeros(
                     (src.numel(), self.edge_attr_dim),
                     device=h_src.device,
@@ -176,12 +177,11 @@ class HeteroHGTStarPredictor(nn.Module):
             t_idx = self._time_to_index(edge_label_time)
             t_feat = self.time_enc(t_idx)
 
-        # Edge attribute boosting
-        e = torch.cat([edge_label_attr, t_feat] if self.edge_in_dim > 0 else [], dim=-1)  # [M, D']
-        e = self.edge_repr(e) if e.numel() > 0 else e  # [M, edge_emb_dim] or []
-        e = e * self.edge_gain          # [M, edge_emb_dim] or []
-        if e.numel() > 0:
+        if self.edge_in_dim > 0:
+            e = torch.cat([edge_label_attr, t_feat], dim=-1)
+            e = self.edge_repr(e)
+            e = e * self.edge_gain
             parts.append(e)
 
-        z = torch.cat(parts, dim=-1)     # [M, head_in]
-        return self.classifier(z)        # [M, num_classes]
+        z = torch.cat(parts, dim=-1)
+        return self.classifier(z)

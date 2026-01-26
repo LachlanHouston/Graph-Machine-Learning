@@ -1,4 +1,5 @@
 import os
+import copy
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from hydra.utils import to_absolute_path
@@ -10,9 +11,10 @@ from tqdm import tqdm
 from torch_geometric.loader import LinkNeighborLoader
 from sklearn.metrics import f1_score
 
+from graph_ml import data
 from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year, check_uniform_edge_attr_dim
 from graph_ml.model import HeteroHGTStarPredictor
-from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits, log_confmatrix
+from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits, log_confmatrix, ordinal_targets, FocalLoss, EarlyStopping
 
 try:
     import wandb
@@ -21,30 +23,6 @@ except ImportError:
 
 filterwarnings("ignore")
 use_amp = False
-
-class FocalLoss(torch.nn.Module):
-    """
-    Implementation of the Focal loss function
-
-        Args:
-            weight: class weight vector to be used in case of class imbalance
-            gamma: hyper-parameter for the focal loss scaling.
-    """
-    def __init__(self, weight=None, gamma=2):
-        super(FocalLoss, self).__init__()
-        self.gamma = gamma
-        self.weight = weight #weight parameter will act as the alpha parameter to balance class weights
-
-    def forward(self, outputs, targets):
-        ce_loss = torch.nn.functional.cross_entropy(outputs, targets, reduction='none', weight=self.weight) 
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1-pt)**self.gamma * ce_loss).mean() # mean over the batch
-        return focal_loss
-
-def ordinal_targets(y):
-    B = y.size(0)
-    k = torch.arange(1, 5, device=y.device).unsqueeze(0).expand(B, -1)
-    return (y.unsqueeze(1) > k).float()
 
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="config")
 def main(cfg: DictConfig):
@@ -62,7 +40,9 @@ def main(cfg: DictConfig):
     data = load_yelp_as_hetero(
         data_dir=data_dir,
         max_reviews=cfg.data.max_reviews,
+        sample_method="reservoir",
         min_review_len=cfg.data.min_review_len,
+        coverage_threshold=cfg.data.coverage_threshold,
         seed=cfg.data.seed,
         cache=True,
         cache_subdir="processed",
@@ -76,10 +56,10 @@ def main(cfg: DictConfig):
     edge_attr_dim = check_uniform_edge_attr_dim(data, rel, ("user", "friends", "user"))
 
     train_idx, val_idx = split_edge_indices_by_year(
-        data, rel=rel, boundary_year=2017, include_boundary_in_train=True
+        data, rel=rel, boundary_year=cfg.data.year_cutoff, include_boundary_in_train=True
     )
 
-    full_edge_attr = data[rel].edge_attr.to(device)
+    full_edge_attr = data[rel].edge_attr
 
     # Seed edge pairs (positives only)
     train_pos = data[rel].edge_index[:, train_idx]
@@ -126,9 +106,14 @@ def main(cfg: DictConfig):
         edge_label_time=val_years,
     )
 
+    num_users = data["user"].num_nodes
+    num_businesses = data["business"].num_nodes
+
     model = HeteroHGTStarPredictor(
         metadata=data.metadata(),
         node_feat_dim=data['user'].x.size(1),
+        num_users=num_users,
+        num_businesses=num_businesses,
         hidden_dim=cfg.model.n_hid,
         num_layers=cfg.model.n_layers,
         num_heads=cfg.model.n_heads,
@@ -137,6 +122,8 @@ def main(cfg: DictConfig):
         edge_attr_dim=edge_attr_dim,
         edge_embed_dim=cfg.model.edge_embed_dim,
         time_out=16,
+        use_edge_attr_in_head=True,
+        use_time_in_head=True,
     ).to(device)
 
     print('Number of Parameters for Total model:', get_n_params(model))
@@ -156,11 +143,16 @@ def main(cfg: DictConfig):
         optimizer,
         mode="min",          # we minimize val_rmse
         factor=0.5,
-        patience=2,
+        patience=5,
         threshold=1e-3,
         threshold_mode="rel",
         cooldown=0,
         min_lr=cfg.train.lr_scheduler_min,
+    )
+
+    early_stopper = EarlyStopping(
+        patience=cfg.train.early_stopping_patience,
+        delta=cfg.train.early_stopping_delta,
     )
 
     run = None
@@ -177,15 +169,7 @@ def main(cfg: DictConfig):
             )
             wandb.watch(model, log="gradients")
 
-    # Class weights from training split to address imbalance
-    train_labels = (train_stars - 1).clamp_(0, 4)
-    class_counts = torch.bincount(train_labels, minlength=5).float()
-    class_counts = class_counts.clamp(min=1.0)
-    class_weights = (class_counts.sum() / (class_counts.numel() * class_counts)).to(device)
-
-    loss_fn = FocalLoss(weight=class_weights)
-
-    best_val = float("inf")
+    loss_fn = FocalLoss(gamma=2.0)
     train_step = 0
 
     epoch_bar = tqdm(range(1, cfg.train.n_epoch + 1), desc="Epochs", leave=True)
@@ -203,12 +187,14 @@ def main(cfg: DictConfig):
             y_train = (y_train - 1).clamp_(0, 4)
             optimizer.zero_grad(set_to_none=True)
 
+            edge_label_attr = full_edge_attr[batch[rel].input_id].to(device, non_blocking=True) if batch[rel].edge_attr is not None else None
+
             out = model(
                 batch.x_dict,
                 batch.edge_index_dict,
                 edge_label_index=batch[rel].edge_label_index,
                 label_edge_type=rel,
-                edge_label_attr=full_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
+                edge_label_attr=edge_label_attr,
                 edge_label_time=getattr(batch[rel], "edge_label_time", None),
             )
 
@@ -311,12 +297,6 @@ def main(cfg: DictConfig):
                 'val/f1_macro': f1_macro,
             }, step=train_step)
 
-        if val_rmse < best_val:
-            print(f'Saving new best model with val_acc: {val_acc:.4f} and val_rmse: {val_rmse:.4f}')
-            best_val = val_rmse
-            os.makedirs(os.path.dirname(cfg.train.model_path), exist_ok=True)
-            torch.save(model.state_dict(), cfg.train.model_path)
-
         epoch_bar.set_postfix({
             'train_loss': f'{avg_loss:.4f}',
             'val_loss': f'{val_loss:.4f}',
@@ -326,6 +306,12 @@ def main(cfg: DictConfig):
             'f1_macro': f'{f1_macro:.4f}',
             'lr': f'{current_lr:.2e}',
         })
+
+        early_stopper(val_loss, model)
+        if early_stopper.early_stop:
+            print("Early stopping triggered...")
+            early_stopper.save_best_model(cfg.train.model_path)
+            break
 
     if run is not None:
         run.finish()

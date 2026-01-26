@@ -258,9 +258,9 @@ if __name__ == "__main__":
     )
 
     num_neighbors = {
-        ("user","reviews","business"):   [20, 15, 10, 5],
-        ("business","rev_reviews","user"): [6, 3, 0, 0],
-        ("user","friends","user"):       [6, 4, 2, 0],
+        ("user","reviews","business"):   [0, 0, 0, 0],
+        ("business","rev_reviews","user"): [0, 0, 0, 0],
+        ("user","friends","user"):       [0, 0, 0, 0],
     }
 
     stars = data[rel].edge_label
@@ -269,7 +269,7 @@ if __name__ == "__main__":
     train_label = stars[train_idx]
     val_label   = stars[val_idx]
 
-    batch_size = 2
+    batch_size = 10
 
     common_kwargs = dict(
         data=data,

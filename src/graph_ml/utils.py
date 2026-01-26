@@ -116,3 +116,55 @@ def log_confmatrix(run, y_true_i, y_pred_i, step, normalize=None, title="Val Con
 
     run.log({"val/confusion_matrix": wandb.Image(fig)}, step=step)
     plt.close(fig)
+
+class EarlyStopping:
+    def __init__(self, patience=5, delta=0.0):
+        self.patience = patience
+        self.delta = float(delta)
+        self.best_score = None
+        self.counter = 0
+        self.early_stop = False
+        self.best_model_state = None
+
+    @torch.no_grad()
+    def __call__(self, val_loss, model):
+        score = -float(val_loss)
+        if self.best_score is None or score > self.best_score + self.delta:
+            self.best_score = score
+            # deep copy snapshot (safe)
+            self.best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+    def load_best_model(self, model):
+        model.load_state_dict(self.best_model_state)
+
+    def save_best_model(self, path):
+        torch.save(self.best_model_state, path)
+
+class FocalLoss(torch.nn.Module):
+    """
+    Implementation of the Focal loss function
+
+        Args:
+            weight: class weight vector to be used in case of class imbalance
+            gamma: hyper-parameter for the focal loss scaling.
+    """
+    def __init__(self, weight=None, gamma=1):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = weight #weight parameter will act as the alpha parameter to balance class weights
+
+    def forward(self, outputs, targets):
+        ce_loss = torch.nn.functional.cross_entropy(outputs, targets, reduction='none', weight=self.weight) 
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1-pt)**self.gamma * ce_loss).mean() # mean over the batch
+        return focal_loss
+
+def ordinal_targets(y):
+    B = y.size(0)
+    k = torch.arange(1, 5, device=y.device).unsqueeze(0).expand(B, -1)
+    return (y.unsqueeze(1) > k).float()
