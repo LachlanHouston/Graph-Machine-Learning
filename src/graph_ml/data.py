@@ -148,13 +148,6 @@ def load_yelp_as_hetero(
     set_seed(seed)
     data_dir = Path(data_dir)
 
-    fp_rev = data_dir / "yelp_academic_dataset_review.json"
-    fp_user = data_dir / "yelp_academic_dataset_user.json"
-    fp_biz = data_dir / "yelp_academic_dataset_business.json"
-    for f in (fp_rev, fp_user, fp_biz):
-        if not f.exists():
-            raise FileNotFoundError(f"Missing file: {f}")
-
     cache_path = data_dir / cache_subdir / "yelp_hetero.pt"
     settings = {
         "max_reviews": max_reviews,
@@ -181,6 +174,13 @@ def load_yelp_as_hetero(
             print(f"  - Stats: {obj['meta'].get('stats')}")
             if obj["meta"].get("settings") == settings:
                 return obj["data"]
+            
+    fp_rev = data_dir / "yelp_academic_dataset_review.json"
+    fp_user = data_dir / "yelp_academic_dataset_user.json"
+    fp_biz = data_dir / "yelp_academic_dataset_business.json"
+    for f in (fp_rev, fp_user, fp_biz):
+        if not f.exists():
+            raise FileNotFoundError(f"Missing file: {f}")
 
     w2v = _get_w2v(w2v_model_name) if use_text_edge_attr else None
     w2v_dim_eff = int(w2v_dim or _W2V_DIM_DEFAULT) if use_text_edge_attr else 0

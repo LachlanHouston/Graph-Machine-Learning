@@ -59,7 +59,11 @@ def main(cfg: DictConfig):
         data, rel=rel, boundary_year=cfg.data.year_cutoff, include_boundary_in_train=True
     )
 
-    full_edge_attr = data[rel].edge_attr
+    train_edge_attr = data[rel].edge_attr[train_idx] if data[rel].edge_attr is not None else None
+    val_edge_attr = data[rel].edge_attr[val_idx] if data[rel].edge_attr is not None else None
+
+    train_edge_attr = train_edge_attr.to(device, non_blocking=True) if train_edge_attr is not None else None
+    val_edge_attr = val_edge_attr.to(device, non_blocking=True) if val_edge_attr is not None else None
 
     # Seed edge pairs (positives only)
     train_pos = data[rel].edge_index[:, train_idx]
@@ -122,8 +126,8 @@ def main(cfg: DictConfig):
         edge_attr_dim=edge_attr_dim,
         edge_embed_dim=cfg.model.edge_embed_dim,
         time_out=16,
-        use_edge_attr_in_head=True,
-        use_time_in_head=True,
+        use_edge_attr_in_head=False,
+        use_time_in_head=False,
     ).to(device)
 
     print('Number of Parameters for Total model:', get_n_params(model))
@@ -187,14 +191,12 @@ def main(cfg: DictConfig):
             y_train = (y_train - 1).clamp_(0, 4)
             optimizer.zero_grad(set_to_none=True)
 
-            edge_label_attr = full_edge_attr[batch[rel].input_id].to(device, non_blocking=True) if batch[rel].edge_attr is not None else None
-
             out = model(
                 batch.x_dict,
                 batch.edge_index_dict,
                 edge_label_index=batch[rel].edge_label_index,
                 label_edge_type=rel,
-                edge_label_attr=edge_label_attr,
+                edge_label_attr=train_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
                 edge_label_time=getattr(batch[rel], "edge_label_time", None),
             )
 
@@ -247,7 +249,7 @@ def main(cfg: DictConfig):
                     batch.edge_index_dict,
                     edge_label_index=batch[rel].edge_label_index,
                     label_edge_type=rel,
-                edge_label_attr=full_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
+                    edge_label_attr=val_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
                     edge_label_time=getattr(batch[rel], "edge_label_time", None),
                 )
 
@@ -277,6 +279,7 @@ def main(cfg: DictConfig):
         y_true_i = y_true.clamp(1, 5).round().int().cpu()
         y_pred_i = y_pred.clamp(1, 5).round().int().cpu()
         val_acc = (y_true_i == y_pred_i).float().mean().item()
+        val_mae = torch.abs(y_true - y_pred).mean().item()
 
         if run is not None and (epoch % cfg.wandb.conf_matrix == 0):
             log_confmatrix(run, y_true_i, y_pred_i, step=train_step, normalize=None, title="Val Confusion Matrix")
@@ -291,6 +294,7 @@ def main(cfg: DictConfig):
                 'train/loss': avg_loss,
                 'train/acc': train_acc,
                 'val/loss': val_loss,
+                'val/mae': val_mae,
                 'val/rmse': val_rmse,
                 'val_acc': val_acc,
                 'val/f1_micro': f1_micro,
@@ -300,6 +304,7 @@ def main(cfg: DictConfig):
         epoch_bar.set_postfix({
             'train_loss': f'{avg_loss:.4f}',
             'val_loss': f'{val_loss:.4f}',
+            'val_mae': f'{val_mae:.4f}',
             'val_rmse': f'{val_rmse:.4f}',
             'val_acc': f'{val_acc:.4f}',
             'f1_micro': f'{f1_micro:.4f}',
@@ -317,4 +322,6 @@ def main(cfg: DictConfig):
         run.finish()
 
 if __name__ == "__main__":
+    print("Starting training...")
     main()
+    print("Training complete.")
