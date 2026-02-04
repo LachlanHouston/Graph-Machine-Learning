@@ -47,7 +47,7 @@ def main(cfg: DictConfig):
         cache=True,
         cache_subdir="processed",
         include_user_friends=True,
-        max_friends_per_user=50,
+        max_friends_per_user=100,
         use_text_edge_attr=cfg.data.use_text_edge_attr,
     )
 
@@ -55,7 +55,7 @@ def main(cfg: DictConfig):
 
     edge_attr_dim = check_uniform_edge_attr_dim(data, rel, ("user", "friends", "user"))
 
-    train_idx, val_idx = split_edge_indices_by_year(
+    train_idx, val_idx, test_idx = split_edge_indices_by_year(
         data, rel=rel, boundary_year=cfg.data.year_cutoff, include_boundary_in_train=True
     )
 
@@ -115,7 +115,7 @@ def main(cfg: DictConfig):
 
     model = HeteroHGTStarPredictor(
         metadata=data.metadata(),
-        node_feat_dim=data['user'].x.size(1),
+        node_in_dims = {ntype: data[ntype].x.size(-1) for ntype in data.node_types},
         num_users=num_users,
         num_businesses=num_businesses,
         hidden_dim=cfg.model.n_hid,
@@ -126,8 +126,8 @@ def main(cfg: DictConfig):
         edge_attr_dim=edge_attr_dim,
         edge_embed_dim=cfg.model.edge_embed_dim,
         time_out=16,
-        use_edge_attr_in_head=False,
-        use_time_in_head=False,
+        use_edge_attr_in_head=True,
+        use_time_in_head=True,
     ).to(device)
 
     print('Number of Parameters for Total model:', get_n_params(model))

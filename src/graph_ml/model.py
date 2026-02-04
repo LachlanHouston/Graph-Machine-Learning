@@ -46,7 +46,7 @@ class HeteroHGTStarPredictor(nn.Module):
     def __init__(
         self,
         metadata,
-        node_feat_dim: int,
+        node_in_dims: Dict[str, int],
         num_users: int, 
         num_businesses: int,
         hidden_dim: int = 256,
@@ -84,7 +84,10 @@ class HeteroHGTStarPredictor(nn.Module):
 
         # Type-specific input projections (keeps things robust even if some types differ)
         self.node_in = nn.ModuleDict({
-            ntype: nn.Linear(node_feat_dim, self.hidden_dim)
+            ntype: nn.Sequential(
+                nn.LayerNorm(node_in_dims[ntype]),
+                nn.Linear(node_in_dims[ntype], self.hidden_dim),
+            )
             for ntype in self.node_types
         })
 
