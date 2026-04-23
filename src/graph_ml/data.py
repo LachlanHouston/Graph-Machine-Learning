@@ -26,10 +26,6 @@ _W2V = None
 _W2V_DIM_DEFAULT = 300
 _TOKEN_PAT = re.compile(r"[A-Za-z']+")
 
-
-# -----------------------------
-# Reservoir sampling utilities
-# -----------------------------
 def reservoir_sample_jsonl(
     path: Path | str,
     k: int,
@@ -70,10 +66,6 @@ def reservoir_sample_jsonl(
 
     return reservoir
 
-
-# -----------------------------
-# Sentiment + W2V utilities
-# -----------------------------
 def _get_sentiment_analyzer():
     global _SENT
     if _SENT is None:
@@ -92,7 +84,6 @@ def _vader_scores(text: str, *, mode: str, analyser) -> np.ndarray:
         return np.array([s["compound"]], dtype=np.float32)
     return np.array([s["neg"], s["neu"], s["pos"], s["compound"]], dtype=np.float32)
 
-
 def _get_w2v(model_name: str):
     global _W2V
     if _W2V is None:
@@ -105,7 +96,6 @@ def _get_w2v(model_name: str):
 def _simple_tokenize(s: str) -> List[str]:
     return [t.lower() for t in _TOKEN_PAT.findall(s or "")]
 
-
 def _mean_w2v(tokens: Sequence[str], w2v, dim: int) -> np.ndarray:
     known = [t for t in tokens if t in w2v.key_to_index]
     if not known:
@@ -116,26 +106,16 @@ def _mean_w2v(tokens: Sequence[str], w2v, dim: int) -> np.ndarray:
     vec /= float(len(known))
     return vec
 
-
-# -----------------------------
-# Caching utilities
-# -----------------------------
 def _file_fingerprint(p: Path) -> str:
     st = p.stat()
     return f"{st.st_size}-{st.st_mtime_ns}"
-
 
 def _parse_friends_field(s: Optional[str]) -> List[str]:
     if not s or s == "None":
         return []
     return [t.strip() for t in s.split(",") if t.strip()]
 
-
-# -----------------------------
-# "Raw" node attribute handling
-# -----------------------------
 def _is_number(x: Any) -> bool:
-    # bool is a subclass of int, so exclude it here
     return isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, bool)
 
 
@@ -181,19 +161,15 @@ def vectorize_numeric(r: Dict[str, Any], keys: List[str]) -> np.ndarray:
             out[i] = 0.0
     return out
 
-
-# -----------------------------
-# Main loader
-# -----------------------------
 def load_yelp_as_hetero(
     data_dir: Path | str,
     *,
     # Reviews
     max_reviews: Optional[int] = 100_000,  # if None: stream all (no reservoir)
     sample_method: str = "reservoir",  # "reservoir" or "prefix"
-    reservoir_max_lines: Optional[int] = None,  # optional cap on lines considered for reservoir/prefix
+    reservoir_max_lines: Optional[int] = None,
     # Filtering (token-based)
-    min_review_len: int = 5,  # MIN TOKENS (not chars)
+    min_review_len: int = 5, 
     coverage_threshold: float = 0.2,  # only used if use_text_edge_attr=True
     # General
     seed: int = 42,
@@ -207,9 +183,8 @@ def load_yelp_as_hetero(
     w2v_model_name: str = "word2vec-google-news-300",
     w2v_dim: Optional[int] = None,
     use_sentiment_edge_attr: bool = True,
-    sentiment_mode: str = "vader4",  # "vader4" or "compound"
+    sentiment_mode: str = "vader4",
     zscore_sentiment: bool = False,
-    # Raw node attributes behavior
     store_raw_node_dicts: bool = False,
 ) -> HeteroData:
     """
@@ -219,10 +194,8 @@ def load_yelp_as_hetero(
       - optional friend edges user->user with zero edge_attr (matched width) + constant time
 
     Node attributes:
-      - data["user"].x / data["business"].x contain *all numeric/bool raw JSON fields* (no transforms),
-        based on a schema inferred from the kept nodes.
-      - (optional) data["user"].raw / data["business"].raw store the full raw JSON dict per node index.
-        NOTE: this can be memory-heavy; disable via store_raw_node_dicts=False if needed.
+      - data["user"].x / data["business"].x contain *all numeric/bool raw JSON fields*
+      - (optional) data["user"].raw / data["business"].raw store the full raw JSON dict per node index
     """
     set_seed(seed)
     data_dir = Path(data_dir)
@@ -269,7 +242,6 @@ def load_yelp_as_hetero(
     if use_sentiment_edge_attr and analyser is None:
         raise RuntimeError("Sentiment requested but VADER sentiment analyzer is unavailable.")
 
-    # ---- load reviews (prefix or reservoir) ----
     if max_reviews is None:
         review_iter: List[Dict[str, Any]] | None = None  # stream
     else:
@@ -303,7 +275,6 @@ def load_yelp_as_hetero(
                         continue
                     review_iter.append(json.loads(line))
 
-    # ---- parse reviews into edges + edge features ----
     rev_rows: List[Tuple[str, str, float, int]] = []
     rev_embs: List[np.ndarray] = []
     rev_sents: List[np.ndarray] = []
@@ -321,7 +292,7 @@ def load_yelp_as_hetero(
             return
 
         if use_text_edge_attr:
-            known = [t for t in tokens if t in w2v.key_to_index]  # type: ignore[union-attr]
+            known = [t for t in tokens if t in w2v.key_to_index]
             coverage = len(known) / max(1, len(tokens))
             if coverage < coverage_threshold:
                 n_drop_cov += 1
@@ -339,7 +310,7 @@ def load_yelp_as_hetero(
         rev_rows.append((uid, bid, stars, year))
 
         if use_text_edge_attr:
-            rev_embs.append(_mean_w2v(tokens, w2v, w2v_dim_eff))  # type: ignore[arg-type]
+            rev_embs.append(_mean_w2v(tokens, w2v, w2v_dim_eff))
         if use_sentiment_edge_attr:
             rev_sents.append(_vader_scores(txt, mode=sentiment_mode, analyser=analyser))
 
@@ -371,7 +342,6 @@ def load_yelp_as_hetero(
     if not rev_rows:
         raise RuntimeError("No reviews loaded after filtering. Lower thresholds or increase max_reviews.")
 
-    # ---- load users/businesses sets + full raw json dicts ----
     user_ids: set[str] = set()
     biz_ids: set[str] = set()
     user_json: Dict[str, Dict[str, Any]] = {}
@@ -397,7 +367,6 @@ def load_yelp_as_hetero(
     if not any(keep_mask):
         raise RuntimeError("No overlapping user/business ids with reviews.")
 
-    # filter aligned feature arrays consistently
     if use_text_edge_attr or use_sentiment_edge_attr:
         rev_rows_f: List[Tuple[str, str, float, int]] = []
         rev_embs_f: List[np.ndarray] = [] if use_text_edge_attr else []
@@ -437,9 +406,8 @@ def load_yelp_as_hetero(
     data[USER].num_nodes = len(uniq_users)
     data[BUS].num_nodes = len(uniq_biz)
 
-    # ---- NEW: Use ALL numeric/bool raw JSON fields as node features (no transforms) ----
-    USER_IGNORE = {"user_id", "average_stars"}  # keep id out of numeric schema
-    BIZ_IGNORE = {"business_id", "stars"}  # keep id out of numeric schema
+    USER_IGNORE = {"user_id", "average_stars"} 
+    BIZ_IGNORE = {"business_id", "stars"}
 
     user_records = [user_json[u] for u in uniq_users if u in user_json]
     biz_records = [biz_json[b] for b in uniq_biz if b in biz_json]
@@ -447,7 +415,6 @@ def load_yelp_as_hetero(
     user_num_keys = extract_numeric_schema(user_records, ignore_keys=USER_IGNORE)
     biz_num_keys = extract_numeric_schema(biz_records, ignore_keys=BIZ_IGNORE)
 
-    # If schema ends up empty for some reason, fall back to old 2-dim features (rare)
     if len(user_num_keys) == 0:
         user_feat = np.zeros((len(u2i), 2), dtype=np.float32)
         for uid, i in u2i.items():
@@ -474,18 +441,17 @@ def load_yelp_as_hetero(
         data[BUS].x = torch.tensor(biz_x, dtype=torch.float32)
         data[BUS].feat_names = biz_num_keys
 
-    # Store full raw dicts (strings/lists/dicts etc.) aligned with node indices
+    # Store full raw dicts
     if store_raw_node_dicts:
         data[USER].raw = [user_json[u] for u in uniq_users]
         data[BUS].raw = [biz_json[b] for b in uniq_biz]
 
-    # ---- reviews edges ----
+    # Edges
     data[REL].edge_index = torch.tensor(np.vstack([u_idx, b_idx]), dtype=torch.long)
-    # Note: original code stores stars as long; keeping unchanged for compatibility with your pipeline.
     data[REL].edge_label = torch.tensor(stars, dtype=torch.long)
     data[REL].time = torch.tensor(years, dtype=torch.long).view(-1)
 
-    # edge_attr = [W2V || SENT || time_zscore]
+    # Edge_attr = [W2V || SENT || time_zscore]
     time_f = data[REL].time.to(torch.float32).view(-1, 1)
     time_f = (time_f - time_f.mean()) / (time_f.std() + 1e-6)
 
@@ -506,7 +472,7 @@ def load_yelp_as_hetero(
     data[REL].edge_attr = torch.cat(parts, dim=-1)
     reviews_edge_attr_dim = int(data[REL].edge_attr.size(-1))
 
-    # ---- friends edges ----
+    # Friends
     if include_user_friends:
         friend_pairs: List[Tuple[int, int]] = []
 
@@ -563,7 +529,6 @@ def load_yelp_as_hetero(
                         kept=n_kept_pairs,
                     )
 
-        # Optional: dedupe and count duplicates removed
         if friend_pairs:
             before = len(friend_pairs)
             friend_pairs = list(set(friend_pairs))
@@ -577,8 +542,7 @@ def load_yelp_as_hetero(
         data[FRIENDS].edge_index = ei
         ef = ei.size(1)
         data[FRIENDS].edge_attr = torch.zeros(ef, reviews_edge_attr_dim, dtype=torch.float32)
-        min_year = int(data[REL].time.min().item()) if data[REL].time.numel() > 0 else 0
-        data[FRIENDS].time = torch.full((ef,), min_year - 1, dtype=torch.long)
+        data[FRIENDS].time = torch.full((ef,), 0, dtype=torch.long)
 
         print(
             f"[friends] users_seen={n_users_seen:,} "
@@ -592,13 +556,13 @@ def load_yelp_as_hetero(
         )
 
     # Make undirected (adds reverse edges / merges)
-    data = T.ToUndirected(reduce="add", merge=True)(data)
+    data = T.ToUndirected(reduce="add", merge=False)(data)
 
     for et in data.edge_types:
         if "time" in data[et]:
             data[et].time = data[et].time.view(-1)
 
-    # ---- cache ----
+    # Caching
     if cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         meta = {
@@ -673,7 +637,7 @@ def split_edge_indices_by_year(
     rel: Tuple[str, str, str],
     boundary_year: int = 2021,
     include_boundary_in_train: bool = True,
-    test_ratio_in_future: float = 0.5,  # fraction of "future" used for test; rest is val
+    test_ratio_in_future: float = 0.5,  # fraction of "future" used for test, rest is val
     shuffle_within_splits: bool = False,
     seed: int = 42,
 ) -> Tuple[Tensor, Tensor, Tensor]:
@@ -708,7 +672,7 @@ def split_edge_indices_by_year(
         future_idx = future_idx[torch.randperm(future_idx.numel(), generator=g)]
 
     n_test = int(round(test_ratio_in_future * future_idx.numel()))
-    n_test = max(1, min(n_test, future_idx.numel() - 1))  # ensure both non-empty
+    n_test = max(1, min(n_test, future_idx.numel() - 1))
 
     test_idx = future_idx[:n_test]
     val_idx = future_idx[n_test:]

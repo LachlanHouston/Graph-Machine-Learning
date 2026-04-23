@@ -82,7 +82,7 @@ class HeteroHGTStarPredictor(nn.Module):
         self.time_enc = RelTemporalEncoding(self.time_out, max_len=self.max_time_len, dropout=dropout) \
             if self.use_time_in_head else None
 
-        # Type-specific input projections (keeps things robust even if some types differ)
+        # Type-specific input projections
         self.node_in = nn.ModuleDict({
             ntype: nn.Sequential(
                 nn.LayerNorm(node_in_dims[ntype]),
@@ -91,7 +91,7 @@ class HeteroHGTStarPredictor(nn.Module):
             for ntype in self.node_types
         })
 
-        # HGTConv stack (hetero-native)
+        # HGTConv stack
         self.convs = nn.ModuleList([
             HGTConv(
                 in_channels=self.hidden_dim,
@@ -118,7 +118,7 @@ class HeteroHGTStarPredictor(nn.Module):
 
         self.do = nn.Dropout(self.dropout)
 
-        # Single linear layer (your requirement #3)
+        # Single linear layer
         head_in = 2 * self.hidden_dim + (self.edge_emb_dim if self.edge_in_dim > 0 else 0)
         self.classifier = nn.Linear(head_in, num_classes)
 
@@ -137,16 +137,6 @@ class HeteroHGTStarPredictor(nn.Module):
         edge_label_attr: Optional[Tensor] = None,
         edge_label_time: Optional[Tensor] = None,
     ) -> Tensor:
-        """
-        Pure PyG style:
-        - First two positional args are x_dict and edge_index_dict
-        - Supervised edges come from edge_label_index (hetero-local node indices)
-        - Optional supervised-edge features provided explicitly:
-            edge_label_attr: edge_attr for the supervised edges only (shape [M, D])
-            edge_label_time: time for the supervised edges only (shape [M])
-        Returns:
-            logits [M, num_classes]
-        """
         # 1) Project nodes
         x_dict = {nt: self.node_in[nt](x.float()) for nt, x in x_dict.items()}
 
@@ -155,10 +145,9 @@ class HeteroHGTStarPredictor(nn.Module):
             x_dict = conv(x_dict, edge_index_dict)
             x_dict = {nt: self.do(F.relu(x)) for nt, x in x_dict.items()}
 
-        # 3) Gather embeddings for supervised edges (edge_label_index)
+        # 3) Gather embeddings
         src_type, _, dst_type = label_edge_type
-        src, dst = edge_label_index[0], edge_label_index[1]  # [M], [M]
-
+        src, dst = edge_label_index[0], edge_label_index[1]
         h_src = x_dict[src_type][src]
         h_dst = x_dict[dst_type][dst]
         parts = [h_src, h_dst]
@@ -180,6 +169,7 @@ class HeteroHGTStarPredictor(nn.Module):
             t_idx = self._time_to_index(edge_label_time)
             t_feat = self.time_enc(t_idx)
 
+        # 6) Edge boost
         if self.edge_in_dim > 0:
             e = torch.cat([edge_label_attr, t_feat], dim=-1)
             e = self.edge_repr(e)
@@ -187,4 +177,4 @@ class HeteroHGTStarPredictor(nn.Module):
             parts.append(e)
 
         z = torch.cat(parts, dim=-1)
-        return self.classifier(z)
+        return self.classifier(z) # Classify

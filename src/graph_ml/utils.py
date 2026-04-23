@@ -51,7 +51,7 @@ def build_num_neighbors_from_cfg(cfg):
         nn[(src, rel, dst)] = hops
         hop_lengths.add(len(hops))
 
-    # Ensure consistent number of hops across relations (required by PyG)
+    # Ensure consistent number of hops across relations
     if len(hop_lengths) > 1:
         raise ValueError(
             f"Inconsistent hops across relations: lengths = {sorted(hop_lengths)}. "
@@ -96,7 +96,6 @@ def log_confmatrix(run, y_true_i, y_pred_i, step, normalize=None, title="Val Con
         return
 
     class_labels = ['1 star', '2 star', '3 star', '4 star', '5 star']
-    # keep labels explicit to pin row/col order
     labels = [1, 2, 3, 4, 5]
 
     cm = confusion_matrix(
@@ -108,7 +107,7 @@ def log_confmatrix(run, y_true_i, y_pred_i, step, normalize=None, title="Val Con
 
     fig, ax = plt.subplots(figsize=(5, 5))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_labels)
-    # values_format depends on normalization
+
     values_format = '.2f' if normalize else 'd'
     disp.plot(ax=ax, cmap='Blues', colorbar=False, values_format=values_format)
     ax.set_title(title + (f" (normalize={normalize})" if normalize else ""))
@@ -131,7 +130,6 @@ class EarlyStopping:
         score = -float(val_loss)
         if self.best_score is None or score > self.best_score + self.delta:
             self.best_score = score
-            # deep copy snapshot (safe)
             self.best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             self.counter = 0
         else:
@@ -156,12 +154,12 @@ class FocalLoss(torch.nn.Module):
     def __init__(self, weight=None, gamma=1):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
-        self.weight = weight #weight parameter will act as the alpha parameter to balance class weights
+        self.weight = weight # Weight parameter will act as the alpha parameter to balance class weights
 
     def forward(self, outputs, targets):
         ce_loss = torch.nn.functional.cross_entropy(outputs, targets, reduction='none', weight=self.weight) 
         pt = torch.exp(-ce_loss)
-        focal_loss = ((1-pt)**self.gamma * ce_loss).mean() # mean over the batch
+        focal_loss = ((1-pt)**self.gamma * ce_loss).mean()
         return focal_loss
 
 def ordinal_targets(y):

@@ -1,259 +1,230 @@
-# baseline_mean_with_f1.py
-import argparse
 from pathlib import Path
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
 import numpy as np
-import networkx as nx
+import matplotlib.pyplot as plt
+from omegaconf import DictConfig
+import hydra
+from hydra.utils import to_absolute_path
 from tqdm import tqdm
 from torch_geometric.loader import LinkNeighborLoader
-from torch_geometric.explain import Explainer, CaptumExplainer, GNNExplainer
-from torch_geometric.explain.algorithm import AttentionExplainer
+from sklearn.metrics import (
+    f1_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    precision_recall_fscore_support,
+)
+
+from graph_ml.data import (
+    load_yelp_as_hetero,
+    REL,
+    split_edge_indices_by_year,
+    check_uniform_edge_attr_dim,
+)
+from graph_ml.utils import set_seed, build_num_neighbors_from_cfg, ordinal_targets
+from graph_ml.model import HeteroHGTStarPredictor
 
 
-from graph_ml.data import load_yelp_as_hetero, REL, split_edge_indices_by_year, check_uniform_edge_attr_dim
-from graph_ml.utils import set_seed, multilabel_f1_from_logits
-from graph_ml.model_HEAT import HeteroHEATStarPredictor
+def plot_confmatrix(y_true_i, y_pred_i, title="Test Confusion Matrix"):
+    class_labels = ["1 star", "2 star", "3 star", "4 star", "5 star"]
+    labels = [1, 2, 3, 4, 5]
 
-class ExplainAdapter(nn.Module):
-    def __init__(self, core_model, default_label_edge_type=REL):
-        super().__init__()
-        self.core = core_model
-        self.default_label_edge_type = default_label_edge_type
+    y_true = y_true_i.cpu().numpy()
+    y_pred = y_pred_i.cpu().numpy()
 
-        self._ctx_batch = None
-        self._ctx_edge_label_index = None
-        self._ctx_label_edge_type = None
+    cm = confusion_matrix(
+        y_true=y_true,
+        y_pred=y_pred,
+        labels=labels,
+    )
 
-        # keep originals so we can restore after masking
-        self._orig_edge_attr = None
+    cm_norm = confusion_matrix(
+        y_true=y_true,
+        y_pred=y_pred,
+        labels=labels,
+        normalize="true",
+    )
 
-    def set_context(self, batch, edge_label_index=None, label_edge_type=None):
-        self._ctx_batch = batch
-        self._ctx_label_edge_type = label_edge_type or self.default_label_edge_type
-        if edge_label_index is None:
-            edge_label_index = batch[self._ctx_label_edge_type].edge_label_index
-        self._ctx_edge_label_index = edge_label_index
+    fig, ax = plt.subplots(figsize=(6.5, 6))
 
-        # snapshot original edge_attr for all edge types (some may not have edge_attr)
-        self._orig_edge_attr = {}
-        for etype in batch.edge_types:
-            store = batch[etype]
-            if hasattr(store, "edge_attr") and store.edge_attr is not None:
-                self._orig_edge_attr[etype] = store.edge_attr
+    im = ax.imshow(cm_norm, interpolation="nearest", cmap="PuBu")
 
-    def clear_context(self):
-        # restore edge_attr if needed
-        if self._ctx_batch is not None and self._orig_edge_attr is not None:
-            for etype, ea in self._orig_edge_attr.items():
-                self._ctx_batch[etype].edge_attr = ea
-        self._ctx_batch = None
-        self._ctx_edge_label_index = None
-        self._ctx_label_edge_type = None
-        self._orig_edge_attr = None
+    ax.set(
+        xticks=np.arange(len(class_labels)),
+        yticks=np.arange(len(class_labels)),
+        xticklabels=class_labels,
+        yticklabels=class_labels,
+        xlabel="Predicted label",
+        ylabel="True label",
+        title=title,
+    )
 
-    def forward(self, x_dict, edge_index_dict, node_mask=None, edge_mask=None, *args, **kwargs):
-        batch = self._ctx_batch
-        if batch is None:
-            raise ValueError("Call wrapped_model.set_context(batch, ...) before explainer(...).")
+    plt.setp(ax.get_xticklabels(), rotation=35, ha="right", rotation_mode="anchor")
 
-        # ---- Apply node mask (attributes) ----
-        # node_mask is usually a dict for HeteroData, but handle tensor fallback.
-        if isinstance(node_mask, dict):
-            for ntype, x in x_dict.items():
-                m = node_mask.get(ntype, None)
-                batch[ntype].x = x if m is None else (x * m)
-        else:
-            # no per-type mask -> just write x
-            for ntype, x in x_dict.items():
-                batch[ntype].x = x
+    # Add subtle white grid between cells
+    ax.set_xticks(np.arange(-0.5, len(class_labels), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(class_labels), 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=1.5)
+    ax.tick_params(which="minor", bottom=False, left=False)
 
-        # ---- Apply edge mask (attributes) by scaling edge_attr ----
-        if isinstance(edge_mask, dict):
-            for etype, m in edge_mask.items():
-                if etype not in batch.edge_types:
-                    continue
-                store = batch[etype]
-                if not (hasattr(store, "edge_attr") and store.edge_attr is not None):
-                    continue
+    # Use normalized matrix for text contrast threshold
+    thresh = cm_norm.max() / 1.2 if cm_norm.max() > 0 else 0
 
-                ea0 = self._orig_edge_attr.get(etype, store.edge_attr)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            count = cm[i, j]
+            pct = cm_norm[i, j] * 100
+            text = f"{count}\n[{pct:.1f}%]"
 
-                # m can be [E] (object) or [E, F] (attributes)
-                if m.dim() == 1 and m.numel() == ea0.size(0):
-                    store.edge_attr = ea0 * m.view(-1, 1)
-                elif m.dim() == 2 and m.shape == ea0.shape:
-                    store.edge_attr = ea0 * m
-                else:
-                    # still ensure m influences output to avoid "unused tensor" issues
-                    store.edge_attr = ea0
-                    out = self.core(
-                        edge_label_index=self._ctx_edge_label_index,
-                        label_edge_type=self._ctx_label_edge_type,
-                        batch=batch,
-                    )
-                    return out + 0.0 * m.sum()
+            ax.text(
+                j,
+                i,
+                text,
+                ha="center",
+                va="center",
+                color="white" if cm_norm[i, j] > thresh else "#222222",
+                fontsize=10,
+                fontweight="medium",
+            )
 
-        out = self.core(
-            edge_label_index=self._ctx_edge_label_index,
-            label_edge_type=self._ctx_label_edge_type,
-            batch=batch,
+    fig.tight_layout()
+    plt.savefig("reports/figures/test_cormat.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def print_per_class_metrics(y_true_i, y_pred_i, labels=(1, 2, 3, 4, 5), prefix="[Test]"):
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true_i,
+        y_pred_i,
+        labels=list(labels),
+        average=None,
+        zero_division=0,
+    )
+
+    print(f"{prefix} per-class metrics:")
+    for cls, p, r, f, s in zip(labels, precision, recall, f1, support):
+        print(
+            f"  Class {cls}: "
+            f"precision={p:.4f} | recall={r:.4f} | f1={f:.4f} | support={s}"
         )
 
-        # Fallback to ensure edge_mask tensor counts as "used" if it comes as a single tensor
-        if torch.is_tensor(edge_mask) and not isinstance(edge_mask, dict):
-            out = out + 0.0 * edge_mask.sum()
+    return {
+        int(cls): {
+            "precision": float(p),
+            "recall": float(r),
+            "f1": float(f),
+            "support": int(s),
+        }
+        for cls, p, r, f, s in zip(labels, precision, recall, f1, support)
+    }
 
-        return out
 
-class EdgeScorer(nn.Module):
-    def __init__(self, core_model):
-        super().__init__()
-        self.core = core_model
+def _load_ckpt_into_model(model: torch.nn.Module, checkpoint_path: str, device: torch.device):
+    if checkpoint_path is None:
+        return
+    p = Path(checkpoint_path)
+    if not p.exists():
+        print(f"[ckpt] WARNING: checkpoint not found at {checkpoint_path}. Using random-init model.")
+        return
 
-    def forward(self, data):
-        # Predict logits for all seed edges in this mini-batch:
-        out = self.core(
-            edge_label_index=data[REL].edge_label_index,
-            label_edge_type=REL,
-            batch=data,
-        )  # shape [M, C]
-        return out  # Explainer will pick 'index' later
+    ckpt = torch.load(str(p), map_location=device)
+    state = None
+    if isinstance(ckpt, dict):
+        if "model" in ckpt and isinstance(ckpt["model"], dict):
+            state = ckpt["model"]
+        elif "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            state = ckpt["state_dict"]
+        else:
+            state = ckpt
 
-def viz_edge_importance(edge_index, edge_weight, title="Edge importance"):
-    edge_index = edge_index.cpu()
-    w = edge_weight.cpu()
-    G = nx.Graph()
-    G.add_edges_from(edge_index.t().tolist())
-    # Normalize weights for plotting widths
-    w_norm = (w - w.min()) / (w.max() - w.min() + 1e-8)
-    widths = [1.0 + 4.0*wn.item() for wn in w_norm]
-    pos = nx.spring_layout(G, seed=0)
-    plt.figure(figsize=(6,6))
-    nx.draw(G, pos, with_labels=False, node_size=50, width=widths, edge_color=w_norm, edge_cmap=plt.cm.viridis)
-    plt.title(title); plt.tight_layout(); plt.show()
+    if not isinstance(state, dict):
+        print(f"[warn] Could not find a model state_dict in {checkpoint_path}, skipping load.")
+        return
 
-def ordinal_targets(y):
-    B = y.size(0)
-    k = torch.arange(1, 5, device=y.device).unsqueeze(0).expand(B, -1)
-    return (y.unsqueeze(1) > k).float()
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        print(f"[ckpt] Missing keys: {missing}\n[ckpt] Unexpected keys: {unexpected}")
+    print(f"[ckpt] Loaded from: {checkpoint_path}")
 
-# ---------- Metrics ----------
+
 def evaluate_regression(y_pred: torch.Tensor, y_true: torch.Tensor):
     mae = (y_pred - y_true.float()).abs().mean().item()
-    rmse = ((y_pred - y_true.float())**2).mean().sqrt().item()
+    rmse = ((y_pred - y_true.float()) ** 2).mean().sqrt().item()
     acc_round = (y_pred.round().clamp(1, 5).long() == y_true).float().mean().item()
     return {"mae": mae, "rmse": rmse, "acc@rounded": acc_round}
 
-@torch.no_grad()
-def multiclass_f1_from_int_preds(y_pred_int: torch.Tensor, y_true_int: torch.Tensor, average: str = "macro", eps: float = 1e-8):
-    """
-    y_pred_int, y_true_int: int tensors in {1,2,3,4,5}
-    average: 'macro' or 'micro'
-    """
-    # Remap to {0..4}
-    y_pred = y_pred_int.to(torch.long) - 1
-    y_true = y_true_int.to(torch.long) - 1
-    C = 5
 
-    # Confusion counts per class
-    f1_per_class = []
-    tp_sum = fp_sum = fn_sum = 0.0
-
-    for c in range(C):
-        tp = ((y_pred == c) & (y_true == c)).sum().float()
-        fp = ((y_pred == c) & (y_true != c)).sum().float()
-        fn = ((y_pred != c) & (y_true == c)).sum().float()
-
-        if average == "macro":
-            prec = tp / (tp + fp + eps)
-            rec  = tp / (tp + fn + eps)
-            f1_c = 2 * prec * rec / (prec + rec + eps)
-            f1_per_class.append(f1_c)
-        else:
-            tp_sum += tp
-            fp_sum += fp
-            fn_sum += fn
-
-    if average == "macro":
-        return torch.stack(f1_per_class).mean().item()
-    elif average == "micro":
-        prec = tp_sum / (tp_sum + fp_sum + eps)
-        rec  = tp_sum / (tp_sum + fn_sum + eps)
-        f1   = 2 * prec * rec / (prec + rec + eps)
-        return f1.item()
-    else:
-        raise ValueError("average must be 'macro' or 'micro'")
-
-# ---------- Baseline ----------
-def mean_baseline(data_dir: Path, max_reviews: int, seed: int):
+def _build_data_for_baseline(cfg: DictConfig):
+    data_dir = to_absolute_path(cfg.data.data_dir)
+    rel = ("user", "reviews", "business")
     data = load_yelp_as_hetero(
-        data_dir,
-        max_reviews=max_reviews,
+        data_dir=data_dir,
+        max_reviews=cfg.data.max_reviews,
+        sample_method=getattr(cfg.data, "sample_method", "reservoir"),
+        min_review_len=cfg.data.min_review_len,
+        coverage_threshold=cfg.data.coverage_threshold,
+        seed=cfg.data.seed,
         cache=True,
+        cache_subdir="processed",
         include_user_friends=True,
-        use_text_edge_attr=True,   # irrelevant for this baseline
-        seed=seed,
+        max_friends_per_user=100,
+        use_text_edge_attr=cfg.data.use_text_edge_attr,
     )
 
-    y = data[REL].edge_label.view(-1)  # {1..5} long
-
-    train_idx, val_idx = split_edge_indices_by_year(
-        data, boundary_year=2017, include_boundary_in_train=True, shuffle_within_splits=True, seed=seed
+    train_idx, val_idx, test_idx = split_edge_indices_by_year(
+        data,
+        rel=rel,
+        boundary_year=cfg.data.year_cutoff,
+        include_boundary_in_train=True,
+        shuffle_within_splits=True,
+        seed=cfg.data.seed,
     )
 
-    # ---- compute global mean on TRAIN only ----
-    mean_train = y[train_idx].float().mean().item()
+    y = data[rel].edge_label.view(-1)
+    return data, rel, y, train_idx, val_idx, test_idx
+
+
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="config")
+def mean_baseline(cfg: DictConfig):
+    set_seed(cfg.data.seed)
+    _, _, y, train_idx, _, test_idx = _build_data_for_baseline(cfg)
+
+    mean_train = int(round(y[train_idx].float().mean().item()))
 
     def predict(idx: torch.Tensor):
         if idx.numel() == 0:
             return None, None
         y_true = y[idx]
-        y_pred = torch.full_like(y_true, fill_value=mean_train, dtype=torch.float32)
+        y_pred = torch.full((y_true.numel(),), mean_train, dtype=torch.float32, device=y_true.device)
         return y_pred, y_true
 
-    print(f"Train edges: {train_idx.numel()} | Val: {val_idx.numel()}")
+    print(f"Train edges: {train_idx.numel()} | Test: {test_idx.numel()}")
     print(f"Global mean (train): {mean_train:.4f}")
 
-    # ---- VAL ----
-    y_pred, y_true = predict(val_idx)
+    y_pred, y_true = predict(test_idx)
     if y_pred is not None:
-        # Regression-style metrics
-        val_reg = evaluate_regression(y_pred, y_true)
+        test_reg = evaluate_regression(y_pred, y_true)
+        y_pred_i = y_pred.round().clamp(1, 5).long().cpu().numpy()
+        y_true_i = y_true.long().cpu().numpy()
 
-        # Convert to integer classes for F1 (rounded & clamped into 1..5)
-        y_pred_int = y_pred.round().clamp(1, 5).long()
-        y_true_int = y_true.long()
+        labels = [1, 2, 3, 4, 5]
+        f1_macro = f1_score(y_true_i, y_pred_i, average="macro", labels=labels, zero_division=0)
+        f1_micro = f1_score(y_true_i, y_pred_i, average="micro", labels=labels, zero_division=0)
+        per_class = print_per_class_metrics(y_true_i, y_pred_i, labels=labels, prefix="[Test mean baseline]")
 
-        f1_macro = multiclass_f1_from_int_preds(y_pred_int, y_true_int, average="macro")
-        f1_micro = multiclass_f1_from_int_preds(y_pred_int, y_true_int, average="micro")
+        print(f"[Test] mean predictor -> {test_reg} | F1_macro={f1_macro:.4f} | F1_micro={f1_micro:.4f}")
+        print({"per_class": per_class})
 
-        print(f"[Val] mean predictor -> {val_reg} | F1_macro={f1_macro:.4f} | F1_micro={f1_micro:.4f}")
 
-# Most frequent rating baseline
-def top_frequent_baseline(data_dir: Path, max_reviews: int, seed: int):
-    data = load_yelp_as_hetero(
-        data_dir,
-        max_reviews=max_reviews,
-        cache=True,
-        include_user_friends=True,
-        use_text_edge_attr=True,   # irrelevant for this baseline
-        seed=seed,
-    )
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="config")
+def top_frequent_baseline(cfg: DictConfig):
+    set_seed(cfg.data.seed)
+    _, _, y, train_idx, _, test_idx = _build_data_for_baseline(cfg)
 
-    y = data[REL].edge_label.view(-1)  # {1..5} long
-
-    train_idx, val_idx = split_edge_indices_by_year(
-        data, boundary_year=2017, include_boundary_in_train=True, shuffle_within_splits=True, seed=seed
-    )
-
-    # ---- compute most frequent rating on TRAIN only ----
     y_train = y[train_idx]
-    counts = torch.bincount(y_train, minlength=6)  # index 0 unused
-    top_rating = counts[1:].argmax().item() + 1  # +1 since ratings start at 1
+    counts = torch.bincount(y_train, minlength=6)
+    top_rating = counts[1:].argmax().item() + 1
 
     def predict(idx: torch.Tensor):
         if idx.numel() == 0:
@@ -262,259 +233,185 @@ def top_frequent_baseline(data_dir: Path, max_reviews: int, seed: int):
         y_pred = torch.full_like(y_true, fill_value=top_rating, dtype=torch.long)
         return y_pred, y_true
 
-    print(f"Train edges: {train_idx.numel()} | Val: {val_idx.numel()}")
+    print(f"Train edges: {train_idx.numel()} | Test: {test_idx.numel()}")
     print(f"Most frequent rating (train): {top_rating}")
 
-    # ---- VAL ----
-    y_pred, y_true = predict(val_idx)
+    y_pred, y_true = predict(test_idx)
     if y_pred is not None:
-        # Regression-style metrics
-        val_reg = evaluate_regression(y_pred.float(), y_true)
+        test_reg = evaluate_regression(y_pred.float(), y_true)
+        y_pred_i = y_pred.long().cpu().numpy()
+        y_true_i = y_true.long().cpu().numpy()
 
-        # Convert to integer classes for F1 (already int)
-        y_pred_int = y_pred.long()
-        y_true_int = y_true.long()
+        labels = [1, 2, 3, 4, 5]
+        f1_macro = f1_score(y_true_i, y_pred_i, average="macro", labels=labels, zero_division=0)
+        f1_micro = f1_score(y_true_i, y_pred_i, average="micro", labels=labels, zero_division=0)
+        per_class = print_per_class_metrics(y_true_i, y_pred_i, labels=labels, prefix="[Test top-frequent baseline]")
 
-        f1_macro = multiclass_f1_from_int_preds(y_pred_int, y_true_int, average="macro")
-        f1_micro = multiclass_f1_from_int_preds(y_pred_int, y_true_int, average="micro")
+        print(f"[Test] top-frequent predictor -> {test_reg} | F1_macro={f1_macro:.4f} | F1_micro={f1_micro:.4f}")
+        print({"per_class": per_class})
 
-        print(f"[Val] top-frequent predictor -> {val_reg} | F1_macro={f1_macro:.4f} | F1_micro={f1_micro:.4f}")
 
-def evaluate_model(checkpoint_path: Path, data_dir: Path, seed: int):
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="config")
+def evaluate_model(cfg: DictConfig):
+    set_seed(cfg.data.seed)
+
+    checkpoint_paths = ["models/model.pt", "models/model_seed44.pt", "models/model_seed46.pt", "models/model_seed48.pt", "models/model_seed50.pt", "models/model_seed52.pt"]
     rel = ("user", "reviews", "business")
+    data_dir = to_absolute_path(cfg.data.data_dir)
 
-    # -------- Load data --------
     data = load_yelp_as_hetero(
-        data_dir,
+        data_dir=data_dir,
+        max_reviews=cfg.data.max_reviews,
+        sample_method="reservoir",
+        min_review_len=cfg.data.min_review_len,
+        coverage_threshold=cfg.data.coverage_threshold,
+        seed=cfg.data.seed,
         cache=True,
+        cache_subdir="processed",
         include_user_friends=True,
-        use_text_edge_attr=True,
-        seed=seed,
+        max_friends_per_user=100,
+        use_text_edge_attr=cfg.data.use_text_edge_attr,
+        use_sentiment_edge_attr=True,
     )
 
-    # Fanouts per hop per relation (you can tweak)
-    num_neighbors = {
-        ("user", "reviews", "business"): [20, 15, 10, 5],
-        ("business", "rev_reviews", "user"): [6, 3, 0, 0],
-        ("user", "friends", "user"): [6, 4, 2, 0],
-    }
+    num_neighbors = build_num_neighbors_from_cfg(cfg)
 
-    # Temporal split (positives only)
-    train_idx, val_idx = split_edge_indices_by_year(
-        data, rel=rel, boundary_year=2017, include_boundary_in_train=True
+    _, _, test_idx = split_edge_indices_by_year(
+        data, rel=rel, boundary_year=cfg.data.year_cutoff, include_boundary_in_train=True
     )
 
     edge_attr_dim = check_uniform_edge_attr_dim(data, rel, ("user", "friends", "user"))
+    years = data[rel].time.view(-1)
 
-    # Seed edge pairs (positives only)
-    val_pos   = data[rel].edge_index[:, val_idx]
-    val_stars = data[rel].edge_label[val_idx]
-    years     = data[rel].time.view(-1)
-    val_years = years[val_idx]
+    test_pos = data[rel].edge_index[:, test_idx]
+    test_stars = data[rel].edge_label[test_idx]
+    test_years = years[test_idx]
 
-    # -------- Loader --------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_workers = max(1, (os.cpu_count() or 1) - 1) if device.type == "cuda" else 0
-    prefetch_factor = 2 if device.type == "cuda" else None
-    print(f"Using num_workers={num_workers} for data loading")
 
-    common_kwargs = dict(
-        data=data,
-        num_neighbors=num_neighbors,
-        batch_size=4,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=prefetch_factor,
-        time_attr='time',
-    )
+    results = []
 
-    val_loader = LinkNeighborLoader(
-        **common_kwargs,
-        edge_label_index=(rel, val_pos),
-        edge_label=val_stars,
-        edge_label_time=val_years,
-    )
+    for pth in checkpoint_paths:
 
-    # -------- Model --------
+        model = HeteroHGTStarPredictor(
+            metadata=data.metadata(),
+            node_in_dims={ntype: data[ntype].x.size(-1) for ntype in data.node_types},
+            num_users=data["user"].num_nodes,
+            num_businesses=data["business"].num_nodes,
+            hidden_dim=cfg.model.n_hid,
+            num_layers=cfg.model.n_layers,
+            num_heads=cfg.model.n_heads,
+            dropout=cfg.model.dropout,
+            num_classes=5,
+            edge_attr_dim=edge_attr_dim,
+            edge_embed_dim=cfg.model.edge_embed_dim,
+            time_out=16,
+            use_edge_attr_in_head=True,
+            use_time_in_head=True,
+        ).to(device)
 
-    model = HeteroHEATStarPredictor(
-        metadata=data.metadata(),
-        node_feat_dim=data['user'].x.size(1),
-        hidden_dim=512,
-        num_layers=4,
-        num_heads=8,
-        dropout=0.1,
-        edge_attr_dim=edge_attr_dim,
-    ).to(device)
+        _load_ckpt_into_model(model, pth, device)
+        model.eval()
 
-    # -------- Load checkpoint (robust) --------
-    if checkpoint_path is not None and Path(checkpoint_path).exists():
-        ckpt = torch.load(checkpoint_path, map_location=device)
-        state = None
-        if isinstance(ckpt, dict):
-            # common keys: 'model', 'state_dict'
-            if 'model' in ckpt and isinstance(ckpt['model'], dict):
-                state = ckpt['model']
-            elif 'state_dict' in ckpt and isinstance(ckpt['state_dict'], dict):
-                state = ckpt['state_dict']
-        if state is None and isinstance(ckpt, dict):
-            # maybe it's already the raw state_dict
-            state = ckpt
-        if state is None:
-            print(f"[warn] Could not find a model state_dict in {checkpoint_path}, skipping load.")
-        else:
-            missing, unexpected = model.load_state_dict(state, strict=False)
-            if missing or unexpected:
-                print(f"[ckpt] Missing keys: {missing}\n[ckpt] Unexpected keys: {unexpected}")
-        print(f"[ckpt] Loaded from: {checkpoint_path}")
-    else:
-        print(f"[ckpt] WARNING: checkpoint not found at {checkpoint_path}. Evaluating random-init model.")
+        test_edge_attr = data[rel].edge_attr[test_idx] if data[rel].edge_attr is not None else None
+        test_edge_attr = test_edge_attr.to(device, non_blocking=True) if test_edge_attr is not None else None
 
-    # -------- Eval loop --------
-    model.eval()
-    # y_true_stars = []
-    # y_pred_stars = []
-    # val_logits_list = []
-    # val_targets_list = []
-    # se_sum = 0.0
-    # n_sum = 0
+        num_workers = max(1, os.cpu_count() - 1) if device.type == "cuda" else 0
+        print(f"Using num_workers={num_workers} for data loading")
 
-    # iter = 0
+        prefetch_factor = 2 if device.type == "cuda" else None
 
-    # with torch.inference_mode(), torch.cuda.amp.autocast(enabled=False):
-    #     for batch in tqdm(val_loader, desc="Val", leave=False, dynamic_ncols=True):
-    #         iter += 1
-    #         batch = batch.to(device, non_blocking=True)
-    #         y = batch[rel].edge_label.float()
+        common_kwargs = dict(
+            data=data,
+            num_neighbors=num_neighbors,
+            batch_size=cfg.train.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=prefetch_factor,
+            time_attr="time",
+        )
 
-    #         out = model(  # ordinal logits [B,4] or [B,5] depending on your model
-    #             edge_label_index=batch[rel].edge_label_index,
-    #             label_edge_type=rel,
-    #             batch=batch,
-    #         )
+        test_loader = LinkNeighborLoader(
+            **{**common_kwargs, "shuffle": False},
+            edge_label_index=(rel, test_pos),
+            edge_label=test_stars,
+            edge_label_time=test_years,
+        )
 
-    #         # Ordinal targets for reporting F1; not used in RMSE
-    #         t = ordinal_targets(y)
+        se_sum = 0
+        n_sum = 0
+        y_true_stars = []
+        y_pred_stars = []
 
-    #         # Decode stars from ordinal logits: 1 + count(sigmoid > 0.5)
-    #         probs = torch.sigmoid(out)
-    #         preds = 1 + (probs > 0.5).sum(dim=1)
+        with torch.inference_mode():
+            for batch in tqdm(test_loader, desc="Test", leave=False, dynamic_ncols=True):
+                batch = batch.to(device, non_blocking=True)
+                y = batch[rel].edge_label.to(torch.long)
+                y = (y - 1).clamp_(0, 4)
 
-    #         se_sum += ((preds - y) ** 2).sum().item()
-    #         n_sum  += y.numel()
-    #         y_true_stars.append(y)
-    #         y_pred_stars.append(preds)
+                out = model(
+                    batch.x_dict,
+                    batch.edge_index_dict,
+                    edge_label_index=batch[rel].edge_label_index,
+                    label_edge_type=rel,
+                    edge_label_attr=test_edge_attr[batch[rel].input_id] if batch[rel].edge_attr is not None else None,
+                    edge_label_time=getattr(batch[rel], "edge_label_time", None),
+                )
 
-    #         val_logits_list.append(out.detach().cpu())
-    #         val_targets_list.append(t.detach().cpu())
+                pred_cls = out.argmax(dim=1)
+                preds = 1 + pred_cls
 
-    #         if iter > 50:
-    #             break
+                se_sum += ((pred_cls - y) ** 2).sum().item()
+                n_sum += y.numel()
+                y_true_stars.append(y + 1)
+                y_pred_stars.append(preds)
 
-    # # -------- Metrics --------
-    # val_rmse = float((se_sum / max(1, n_sum)) ** 0.5)
+        test_rmse = (se_sum / max(1, n_sum)) ** 0.5
 
-    # y_true = torch.cat(y_true_stars).float()
-    # y_pred = torch.cat(y_pred_stars).float()
+        y_true = torch.cat(y_true_stars).float()
+        y_pred = torch.cat(y_pred_stars).float()
+        y_true_i = y_true.clamp(1, 5).round().int().cpu()
+        y_pred_i = y_pred.clamp(1, 5).round().int().cpu()
+        test_acc = (y_true_i == y_pred_i).float().mean().item()
+        test_mae = torch.abs(y_true - y_pred).mean().item()
 
-    # y_true_i = y_true.clamp(1, 5).round().int().cpu()
-    # y_pred_i = y_pred.clamp(1, 5).round().int().cpu()
-    # val_acc = float((y_true_i == y_pred_i).float().mean().item())
+        print(len(y_true))
 
-    # val_logits  = torch.cat(val_logits_list, dim=0)
-    # val_targets = torch.cat(val_targets_list, dim=0)
+        labels = [1, 2, 3, 4, 5]
+        f1_macro = f1_score(y_true_i.numpy(), y_pred_i.numpy(), average="macro", labels=labels, zero_division=0)
+        f1_micro = f1_score(y_true_i.numpy(), y_pred_i.numpy(), average="micro", labels=labels, zero_division=0)
+        per_class = print_per_class_metrics(
+            y_true_i.numpy(),
+            y_pred_i.numpy(),
+            labels=labels,
+            prefix="[Test HGT]",
+        )
 
-    # f1_micro = float(multilabel_f1_from_logits(
-    #     logits=val_logits, targets=val_targets, threshold=0.5, average="micro"
-    # ))
-    # f1_macro = float(multilabel_f1_from_logits(
-    #     logits=val_logits, targets=val_targets, threshold=0.5, average="macro"
-    # ))
+        plot_confmatrix(y_true_i=y_true_i, y_pred_i=y_pred_i)
 
-    # print(f"[Val] RMSE={val_rmse:.4f} | acc@rounded={val_acc:.4f} | F1_macro={f1_macro:.4f} | F1_micro={f1_micro:.4f}")
+        results_dict = {
+            "mae": test_mae,
+            "rmse": test_rmse,
+            "acc": test_acc,
+            "f1_micro": f1_micro,
+            "f1_macro": f1_macro,
+            "per_class": per_class,
+        }
 
-    # # -------- Predicted vs True scatter (saved to disk) --------
-    # # If your model outputs expected rating (soft expectation), you can plot that instead of the thresholded ints.
-    # plt.figure(figsize=(6, 6))
-    # plt.scatter(y_true.cpu().numpy(), y_pred.cpu().numpy(), alpha=0.5)
-    # plt.plot([1, 5], [1, 5], linestyle='--')
-    # plt.xlabel('True rating (stars)')
-    # plt.ylabel('Predicted rating (stars)')
-    # plt.title('Predicted vs True Ratings (Val)')
-    # plt.xticks(np.arange(1, 6)); plt.yticks(np.arange(1, 6))
-    # plt.grid(True, linestyle=':')
-    # out_path = Path("eval_pred_vs_true.png")
-    # plt.tight_layout(); plt.savefig(out_path, dpi=150)
-    # print(f"[Val] Saved scatter plot: {out_path.resolve()}")
+        results.append([test_mae, test_rmse, f1_micro])
 
-    # explainer = Explainer(
-    #     model=EdgeScorer(model).eval(),     # your trained model
-    #     algorithm=AttentionExplainer(reduce='mean'),
-    #     explanation_type='model',              # explain a single edge’s prediction
-    #     edge_mask_type='object',                 # <- pull attentions instead of optimizing a mask
-    #     node_mask_type='attributes',                # (ignored unless you need node attributions)
-    #     model_config=dict(
-    #         mode='multiclass_classification',
-    #         task_level='edge',                      # we explain an edge-level prediction
-    #         return_type='raw',                   # your model returns logits
-    #     )
-    # )
+        print(results_dict)
 
-    wrapped_model = ExplainAdapter(model).to(device).eval()
-
-    explainer = Explainer(
-        model=wrapped_model,
-        algorithm=CaptumExplainer("IntegratedGradients"),
-        explanation_type="model",
-        node_mask_type=None,              # optional: turn off node attr for now
-        edge_mask_type="object",      # <-- IMPORTANT
-        model_config=dict(
-            mode="multiclass_classification",
-            task_level="edge",
-            return_type="raw",
-        ),
-    )
-
-    # Build a tiny loader that seeds ONE target review edge (clean visualization):
-    val_loader_1 = LinkNeighborLoader(
-        data=data,
-        num_neighbors=num_neighbors,
-        batch_size=4,
-        shuffle=False,
-        edge_label_index=(REL, data[REL].edge_index[:, val_idx]),
-        edge_label=data[REL].edge_label[val_idx],
-        edge_label_time=data[REL].time[val_idx],
-        time_attr="time",
-    )
-
-    batch = next(iter(val_loader_1)).to(device)
-    wrapped_model.set_context(batch=batch, edge_label_index=batch[rel].edge_label_index, label_edge_type=rel)
-
-    explanation = explainer(
-        batch.x_dict,
-        batch.edge_index_dict,
-        index=0,
-        # target=...  # you may need this next for multiclass IG
-    )
-
-    wrapped_model.clear_context()
-
-    # print("edge_mask:", explanation.edge_mask_dict)
-    print("node_mask:", explanation.node_mask_dict)
-
-    explanation.visualize_feature_importance(top_k=10)
-
-    return 0
+    results = np.concatenate(results)
+    print(results)
+    return results_dict
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=Path, default='data/raw')
-    parser.add_argument("--max_reviews", type=int, default=250_000)
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-    # mean_baseline(args.data_dir, args.max_reviews, args.seed) # Global mean (train): 3.8233 [Val] mean predictor -> {'mae': 1.1910451650619507, 'rmse': 1.4042346477508545, 'acc@rounded': 0.19322076439857483}
-    # top_frequent_baseline(args.data_dir, args.max_reviews, args.seed) # top-frequent predictor -> {'mae': 1.0489575862884521, 'rmse': 1.7481062412261963, 'acc@rounded': 0.5313649773597717} | F1_macro=0.1388 | F1_micro=0.5314
-    evaluate_model(checkpoint_path=Path("models/focal_loss.pt"), data_dir=args.data_dir, seed=args.seed)
+    print('Evaluating models...')
+    mean_baseline()
+    top_frequent_baseline()
+    evaluate_model()
+    print('Evaluating complete.')

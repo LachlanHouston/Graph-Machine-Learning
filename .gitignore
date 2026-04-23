@@ -211,6 +211,7 @@ data/
 
 # Ignore local checkpoints
 models/
+checkpoints/
 
 # Ignore wandb
 wandb/

@@ -1,20 +1,17 @@
 import os
-import copy
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from hydra.utils import to_absolute_path
 
 import torch
-import torch.nn.functional as F
 from warnings import filterwarnings
 from tqdm import tqdm
 from torch_geometric.loader import LinkNeighborLoader
 from sklearn.metrics import f1_score
 
-from graph_ml import data
 from graph_ml.data import load_yelp_as_hetero, split_edge_indices_by_year, check_uniform_edge_attr_dim
 from graph_ml.model import HeteroHGTStarPredictor
-from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, multilabel_f1_from_logits, log_confmatrix, ordinal_targets, FocalLoss, EarlyStopping
+from graph_ml.utils import get_n_params, set_seed, build_num_neighbors_from_cfg, log_confmatrix, ordinal_targets, FocalLoss, EarlyStopping
 
 try:
     import wandb
@@ -49,13 +46,14 @@ def main(cfg: DictConfig):
         include_user_friends=True,
         max_friends_per_user=100,
         use_text_edge_attr=cfg.data.use_text_edge_attr,
+        use_sentiment_edge_attr=True,
     )
 
     print(data.metadata())
 
     edge_attr_dim = check_uniform_edge_attr_dim(data, rel, ("user", "friends", "user"))
 
-    train_idx, val_idx, test_idx = split_edge_indices_by_year(
+    train_idx, val_idx, _ = split_edge_indices_by_year(
         data, rel=rel, boundary_year=cfg.data.year_cutoff, include_boundary_in_train=True
     )
 
@@ -65,7 +63,6 @@ def main(cfg: DictConfig):
     train_edge_attr = train_edge_attr.to(device, non_blocking=True) if train_edge_attr is not None else None
     val_edge_attr = val_edge_attr.to(device, non_blocking=True) if val_edge_attr is not None else None
 
-    # Seed edge pairs (positives only)
     train_pos = data[rel].edge_index[:, train_idx]
     val_pos   = data[rel].edge_index[:, val_idx]
 
@@ -145,7 +142,7 @@ def main(cfg: DictConfig):
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="min",          # we minimize val_rmse
+        mode="min",          # Minimization of RMSE as metric
         factor=0.5,
         patience=5,
         threshold=1e-3,

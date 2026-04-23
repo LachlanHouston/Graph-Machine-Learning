@@ -1,6 +1,6 @@
 # graph_ml
 
-Repository for special course @DTU regarding Machine Learning on Graphs
+Repository for a special course @DTU regarding Machine Learning on Graphs
 
 ## Project structure
 
